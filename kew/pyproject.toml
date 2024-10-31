@@ -1,0 +1,35 @@
+# First, let's create pyproject.toml (save as kew/pyproject.toml)
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kew"
+version = "0.1.0"
+authors = [
+  { name="Rach Pradhan", email="rach@rachit.ai" },
+]
+description = "A flexible async task queue manager for Python applications"
+readme = "README.md"
+requires-python = ">=3.7"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Framework :: AsyncIO",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+keywords = ["async", "queue", "task", "manager", "concurrent"]
+dependencies = [
+    "typing;python_version<'3.5'",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/justrach/kew"
+"Bug Tracker" = "https://github.com/justrach/kew/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["kew"]
