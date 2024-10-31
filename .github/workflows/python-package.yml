@@ -31,13 +31,7 @@ jobs:
     - name: Run tests with coverage
       working-directory: ./kew
       run: |
-        pytest --cov=kew --cov-report=xml
-        
-    - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v3
-      with:
-        file: ./kew/coverage.xml
-        fail_ci_if_error: true
+        pytest --cov=kew --cov-report=term-missing
 
   build:
     needs: test
