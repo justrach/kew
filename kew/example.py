@@ -1,35 +1,68 @@
-# example.py
 import asyncio
-from kew import TaskQueueManager
+from kew import TaskQueueManager, QueueConfig, QueuePriority
 
 async def example_task(x: int):
     await asyncio.sleep(1)
     return x * 2
 
 async def main():
-    # Initialize the task queue manager
-    manager = TaskQueueManager(max_workers=2)
+    # Create manager
+    manager = TaskQueueManager()
     
-    # Submit a task
-    task_info = await manager.submit_task(
+    # Create queues
+    manager.create_queue(QueueConfig(
+        name="critical",
+        max_workers=4,
+        priority=QueuePriority.HIGH
+    ))
+    
+    manager.create_queue(QueueConfig(
+        name="background",
+        max_workers=1,
+        priority=QueuePriority.LOW
+    ))
+    
+    # Submit tasks to different queues
+    task1 = await manager.submit_task(
         task_id="task1",
+        queue_name="critical",
         task_type="multiplication",
         task_func=example_task,
+        priority=QueuePriority.HIGH,
         x=5
     )
     
-    # Get task status
-    status = manager.get_task_status("task1")
-    print(f"Task status: {status.status}")
+    task2 = await manager.submit_task(
+        task_id="task2",
+        queue_name="background",
+        task_type="multiplication",
+        task_func=example_task,
+        priority=QueuePriority.LOW,
+        x=10
+    )
     
-    # Wait a bit to see the result
+    # Get initial queue statuses
+    print("\nInitial Queue Statuses:")
+    print("Critical Queue:", manager.get_queue_status("critical"))
+    print("Background Queue:", manager.get_queue_status("background"))
+    
+    # Wait for tasks to complete
     await asyncio.sleep(2)
-    status = manager.get_task_status("task1")
-    print(f"Final status: {status.status}")
-    print(f"Result: {status.result}")
     
-    # Cleanup and shutdown - now properly awaited
-    manager.cleanup_old_tasks()
+    # Get final queue statuses
+    print("\nFinal Queue Statuses:")
+    print("Critical Queue:", manager.get_queue_status("critical"))
+    print("Background Queue:", manager.get_queue_status("background"))
+    
+    # Get task results
+    task1_status = manager.get_task_status("task1")
+    task2_status = manager.get_task_status("task2")
+    
+    print("\nTask Results:")
+    print(f"Task 1 (Critical): {task1_status.result}")
+    print(f"Task 2 (Background): {task2_status.result}")
+    
+    # Shutdown
     await manager.shutdown()
 
 if __name__ == "__main__":

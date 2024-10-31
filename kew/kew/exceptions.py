@@ -9,3 +9,7 @@ class TaskAlreadyExistsError(TaskQueueError):
 class TaskNotFoundError(TaskQueueError):
     """Raised when attempting to access a non-existent task"""
     pass
+
+class QueueNotFoundError(TaskQueueError):
+    """Raised when attempting to access a non-existent queue"""
+    pass

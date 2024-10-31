@@ -1,7 +1,7 @@
 # test_multiple.py
 import asyncio
-from kew import TaskQueueManager, TaskStatus
 import random
+from kew import TaskQueueManager, QueueConfig, QueuePriority, TaskStatus
 
 async def long_task(task_num: int, sleep_time: int) -> dict:
     """Simulate a long-running task"""
@@ -12,45 +12,74 @@ async def long_task(task_num: int, sleep_time: int) -> dict:
     return {"task_num": task_num, "result": result}
 
 async def main():
-    # Initialize manager with 2 workers (so only 2 tasks can run simultaneously)
-    manager = TaskQueueManager(max_workers=2)
+    # Initialize manager
+    manager = TaskQueueManager()
     
-    # Submit 5 tasks with different durations
+    # Create queues
+    manager.create_queue(QueueConfig(
+        name="fast_track",
+        max_workers=2,
+        priority=QueuePriority.HIGH
+    ))
+    
+    manager.create_queue(QueueConfig(
+        name="standard",
+        max_workers=1,
+        priority=QueuePriority.LOW
+    ))
+    
+    # Submit tasks to different queues
     tasks = []
-    for i in range(5):
-        sleep_time = random.randint(3, 7)  # Random duration between 3-7 seconds
+    
+    # Submit 3 high-priority tasks
+    for i in range(3):
+        sleep_time = random.randint(2, 4)
         task_info = await manager.submit_task(
-            task_id=f"task{i+1}",
+            task_id=f"high_task_{i+1}",
+            queue_name="fast_track",
             task_type="long_calculation",
             task_func=long_task,
+            priority=QueuePriority.HIGH,
             task_num=i+1,
             sleep_time=sleep_time
         )
         tasks.append(task_info)
-        print(f"Submitted task {i+1}")
+    
+    # Submit 2 low-priority tasks
+    for i in range(2):
+        sleep_time = random.randint(1, 3)
+        task_info = await manager.submit_task(
+            task_id=f"low_task_{i+1}",
+            queue_name="standard",
+            task_type="long_calculation",
+            task_func=long_task,
+            priority=QueuePriority.LOW,
+            task_num=i+1,
+            sleep_time=sleep_time
+        )
+        tasks.append(task_info)
 
-    # Monitor task progress
+    # Monitor progress
     while True:
         all_completed = True
         print("\nCurrent status:")
         for task in tasks:
             status = manager.get_task_status(task.task_id)
-            print(f"{task.task_id}: {status.status.value} - Result: {status.result}")
+            print(f"{task.task_id} ({task.queue_name}): {status.status.value} - Result: {status.result}")
             if status.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED):
                 all_completed = False
         
         if all_completed:
             break
             
-        await asyncio.sleep(1)  # Wait a second before checking again
+        await asyncio.sleep(1)
 
-    # Final results
-    print("\nFinal results:")
-    for task in tasks:
-        status = manager.get_task_status(task.task_id)
-        print(f"{task.task_id}: {status.result}")
+    # Final queue statuses
+    print("\nFinal Queue Statuses:")
+    print("Fast Track Queue:", manager.get_queue_status("fast_track"))
+    print("Standard Queue:", manager.get_queue_status("standard"))
 
-    # Properly await shutdown
+    # Shutdown
     await manager.shutdown()
 
 if __name__ == "__main__":
