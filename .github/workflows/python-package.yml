@@ -9,6 +9,19 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    
+    # Add Redis service
+    services:
+      redis:
+        image: redis:6
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     strategy:
       matrix:
         python-version: [3.8, 3.9, "3.10", "3.11", "3.12"]
@@ -25,11 +38,15 @@ jobs:
       working-directory: ./kew
       run: |
         python -m pip install --upgrade pip
-        pip install build pytest pytest-cov pytest-asyncio
-        pip install -e .
+        # Install test dependencies
+        pip install build pytest pytest-cov pytest-asyncio pytest-redis
+        pip install redis aioredis
+        pip install -e ".[test]"
         
     - name: Run tests with coverage
       working-directory: ./kew
+      env:
+        REDIS_URL: redis://localhost:6379
       run: |
         pytest --cov=kew --cov-report=term-missing
 
