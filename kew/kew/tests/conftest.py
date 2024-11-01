@@ -1,11 +1,15 @@
-# kew/tests/conftest.py
 import pytest
 import asyncio
-from kew import TaskQueueManager
 
-@pytest.fixture
-async def manager():
-    """Fixture that provides a TaskQueueManager instance"""
-    manager = TaskQueueManager()
-    yield manager
-    await manager.shutdown()
+@pytest.fixture(scope="session")
+def event_loop():
+    """Create an instance of the default event loop for each test case."""
+    policy = asyncio.get_event_loop_policy()
+    loop = policy.new_event_loop()
+    yield loop
+    loop.close()
+
+@pytest.fixture(scope="session")
+def anyio_backend():
+    """Backend for anyio/pytest-asyncio."""
+    return 'asyncio'

@@ -13,3 +13,7 @@ class TaskNotFoundError(TaskQueueError):
 class QueueNotFoundError(TaskQueueError):
     """Raised when attempting to access a non-existent queue"""
     pass
+
+class QueueProcessorError(TaskQueueError):
+    """Raised when the queue processor encounters an error"""
+    pass

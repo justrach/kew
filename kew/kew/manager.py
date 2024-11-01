@@ -1,42 +1,69 @@
-# kew/kew/manager.py
-from concurrent.futures import ThreadPoolExecutor
-from queue import PriorityQueue, Queue
-import threading
-from typing import Optional, Dict, Any, Callable, List, Tuple
-from datetime import datetime
+from typing import Optional, Dict, Any, Callable, List
+from datetime import datetime, timedelta
 import logging
 import asyncio
+import json
+import redis.asyncio as redis
 from .models import TaskStatus, TaskInfo, QueueConfig, QueuePriority
-from .exceptions import TaskAlreadyExistsError, TaskNotFoundError, QueueNotFoundError
+from .exceptions import (
+    TaskAlreadyExistsError, 
+    TaskNotFoundError, 
+    QueueNotFoundError,
+    QueueProcessorError
+)
 
 logger = logging.getLogger(__name__)
 
-class PrioritizedItem:
-    def __init__(self, priority: int, item: Any):
-        self.priority = priority
-        self.item = item
-        self.timestamp = datetime.now()
+class CircuitBreaker:
+    def __init__(self, max_failures: int = 3, reset_timeout: int = 60):
+        self.max_failures = max_failures
+        self.reset_timeout = reset_timeout
+        self.failures = 0
+        self.last_failure_time = None
+        self.is_open = False
 
-    def __lt__(self, other):
-        if self.priority != other.priority:
-            return self.priority < other.priority
-        return self.timestamp < other.timestamp
+    async def record_failure(self):
+        self.failures += 1
+        self.last_failure_time = datetime.now()
+        if self.failures >= self.max_failures:
+            self.is_open = True
+            logger.error("Circuit breaker opened due to multiple failures")
+
+    async def reset(self):
+        self.failures = 0
+        self.last_failure_time = None
+        self.is_open = False
+
+    async def check_state(self):
+        if not self.is_open:
+            return True
+        
+        if self.last_failure_time and \
+           (datetime.now() - self.last_failure_time).seconds > self.reset_timeout:
+            await self.reset()
+            return True
+        return False
 
 class QueueWorkerPool:
-    """Manages workers for a specific queue"""
     def __init__(self, config: QueueConfig):
         self.config = config
-        self.executor = ThreadPoolExecutor(max_workers=config.max_workers)
-        self.queue: PriorityQueue[PrioritizedItem] = PriorityQueue(maxsize=config.max_size)
         self._shutdown = False
-        self._tasks: Dict[str, asyncio.Task] = {}
-
+        self._tasks: Dict[str, Dict[str, Any]] = {}
+        self.circuit_breaker = CircuitBreaker()
+        self.processing_semaphore = asyncio.Semaphore(config.max_workers)
+        self.start_processing = asyncio.Event()  # Add this line
 class TaskQueueManager:
-    def __init__(self):
-        """Initialize TaskQueueManager with multiple queue support"""
+    TASK_EXPIRY_SECONDS = 86400  # 24 hours
+    QUEUE_KEY_PREFIX = "queue:"
+    TASK_KEY_PREFIX = "task:"
+    
+    def __init__(self, redis_url: str = "redis://localhost:6379", cleanup_on_start: bool = True):
         self.queues: Dict[str, QueueWorkerPool] = {}
-        self.tasks: Dict[str, TaskInfo] = {}
-        self._lock = threading.Lock()
+        self._lock = asyncio.Lock()
+        self._redis: Optional[redis.Redis] = None
+        self._redis_url = redis_url
+        self._shutdown_event = asyncio.Event()
+        self._cleanup_on_start = cleanup_on_start
         self._setup_logging()
 
     def _setup_logging(self):
@@ -48,50 +75,48 @@ class TaskQueueManager:
         logger.addHandler(handler)
         logger.setLevel(logging.INFO)
 
-    def create_queue(self, config: QueueConfig):
-        """Create a new queue with specified configuration"""
-        with self._lock:
+    async def initialize(self):
+        self._redis = redis.from_url(
+            self._redis_url,
+            encoding="utf-8",
+            decode_responses=True
+        )
+        logger.info("Connected to Redis")
+
+        if self._cleanup_on_start:
+            await self.cleanup()
+
+    async def cleanup(self):
+        if not self._redis:
+            return
+            
+        async for key in self._redis.scan_iter(f"{self.QUEUE_KEY_PREFIX}*"):
+            await self._redis.delete(key)
+            
+        async for key in self._redis.scan_iter(f"{self.TASK_KEY_PREFIX}*"):
+            await self._redis.delete(key)
+            
+        logger.info("Cleaned up all existing queues and tasks")
+
+    async def create_queue(self, config: QueueConfig):
+        async with self._lock:
             if config.name in self.queues:
                 raise ValueError(f"Queue {config.name} already exists")
+            
             worker_pool = QueueWorkerPool(config)
             self.queues[config.name] = worker_pool
-            logger.info(f"Created queue {config.name} with {config.max_workers} workers")
             
-            # Start queue processor
+            await self._redis.hset(
+                f"{self.QUEUE_KEY_PREFIX}{config.name}",
+                mapping={
+                    "max_workers": config.max_workers,
+                    "max_size": config.max_size,
+                    "priority": config.priority.value
+                }
+            )
+            
             asyncio.create_task(self._process_queue(config.name))
-
-    async def _process_queue(self, queue_name: str):
-        """Process tasks in the queue"""
-        worker_pool = self.queues[queue_name]
-        
-        while not worker_pool._shutdown:
-            try:
-                if not worker_pool.queue.empty():
-                    prioritized_item = worker_pool.queue.get_nowait()
-                    task_id = prioritized_item.item
-                    
-                    with self._lock:
-                        task_info = self.tasks[task_id]
-                        if task_info.status == TaskStatus.QUEUED:
-                            # Execute task
-                            task_info.status = TaskStatus.PROCESSING
-                            task_info.started_time = datetime.now()
-                            logger.info(f"Processing task {task_id} from queue {queue_name}")
-                            
-                            # Create task
-                            task = asyncio.create_task(task_info._func(*task_info._args, **task_info._kwargs))
-                            worker_pool._tasks[task_id] = task
-                            
-                            # Add completion callback
-                            task.add_done_callback(
-                                lambda f, tid=task_id: self._handle_task_completion(tid, f)
-                            )
-                
-                await asyncio.sleep(0.1)  # Small delay to prevent busy waiting
-                
-            except Exception as e:
-                logger.error(f"Error processing queue {queue_name}: {str(e)}")
-                await asyncio.sleep(1)  # Longer delay on error
+            logger.info(f"Created queue {config.name} with {config.max_workers} workers")
 
     async def submit_task(
         self,
@@ -99,154 +124,196 @@ class TaskQueueManager:
         queue_name: str,
         task_type: str,
         task_func: Callable,
-        priority: QueuePriority = QueuePriority.MEDIUM,
+        priority: QueuePriority,
         *args,
         **kwargs
     ) -> TaskInfo:
-        """Submit a task to a specific queue"""
-        with self._lock:
-            if task_id in self.tasks:
-                raise TaskAlreadyExistsError(
-                    f"Task with ID {task_id} already exists"
-                )
-            
-            if queue_name not in self.queues:
-                raise QueueNotFoundError(
-                    f"Queue {queue_name} not found"
-                )
-            
-            worker_pool = self.queues[queue_name]
-            task_info = TaskInfo(task_id, task_type, queue_name, priority.value)
-            
-            # Store function and arguments for later execution
-            task_info._func = task_func
-            task_info._args = args
-            task_info._kwargs = kwargs
-            
-            self.tasks[task_id] = task_info
-            
-            # Add to priority queue
-            worker_pool.queue.put(PrioritizedItem(
-                priority=priority.value,
-                item=task_id
-            ))
-            
-            logger.info(f"Task {task_id} submitted to queue {queue_name}")
-            
-            return task_info
-
-    def _handle_task_completion(self, task_id: str, future: asyncio.Future):
-        """Handle task completion and cleanup"""
-        try:
-            result = future.result()
-            with self._lock:
-                task_info = self.tasks[task_id]
-                task_info.result = result
-                task_info.status = TaskStatus.COMPLETED
-                task_info.completed_time = datetime.now()
-                logger.info(f"Task {task_id} completed successfully with result: {result}")
-                
-                # Clean up task
-                worker_pool = self.queues[task_info.queue_name]
-                if task_id in worker_pool._tasks:
-                    del worker_pool._tasks[task_id]
-                    
-        except Exception as e:
-            logger.error(f"Task {task_id} failed: {str(e)}")
-            with self._lock:
-                task_info = self.tasks[task_id]
-                task_info.status = TaskStatus.FAILED
-                task_info.error = str(e)
-                task_info.completed_time = datetime.now()
-
-    def get_task_status(self, task_id: str) -> TaskInfo:
-        """Get status of a specific task"""
-        with self._lock:
-            task_info = self.tasks.get(task_id)
-            if not task_info:
-                raise TaskNotFoundError(f"Task {task_id} not found")
-            return task_info
-
-    def get_queue_status(self, queue_name: str) -> Dict[str, Any]:
-        """Get status of a specific queue"""
-        with self._lock:
+        """Submit a task to a queue"""
+        async with self._lock:
             if queue_name not in self.queues:
                 raise QueueNotFoundError(f"Queue {queue_name} not found")
             
-            worker_pool = self.queues[queue_name]
-            queue_tasks = [
-                task for task in self.tasks.values()
-                if task.queue_name == queue_name
-            ]
+            task_info = TaskInfo(
+                task_id=task_id,
+                task_type=task_type,
+                queue_name=queue_name,
+                priority=priority.value
+            )
             
-            return {
-                "name": queue_name,
-                "max_workers": worker_pool.config.max_workers,
-                "priority": worker_pool.config.priority.value,
-                "active_tasks": len([t for t in queue_tasks if t.status == TaskStatus.PROCESSING]),
-                "queued_tasks": len([t for t in queue_tasks if t.status == TaskStatus.QUEUED]),
-                "completed_tasks": len([t for t in queue_tasks if t.status == TaskStatus.COMPLETED]),
-                "failed_tasks": len([t for t in queue_tasks if t.status == TaskStatus.FAILED])
+            self.queues[queue_name]._tasks[task_id] = {
+                'func': task_func,
+                'args': args,
+                'kwargs': kwargs,
+                'task': None
             }
-
-    async def wait_for_task(self, task_id: str, timeout: Optional[float] = None) -> TaskInfo:
-        """Wait for a specific task to complete"""
-        task_info = self.get_task_status(task_id)
-        worker_pool = self.queues[task_info.queue_name]
+            
+            await self._redis.set(
+                f"{self.TASK_KEY_PREFIX}{task_id}",
+                task_info.to_json(),
+                ex=self.TASK_EXPIRY_SECONDS
+            )
+            
+            # New scoring system:
+            # score = priority * 1_000_000 + timestamp
+            # This ensures:
+            # 1. Priority is the primary factor (lower value = higher priority)
+            # 2. Within same priority, earlier tasks come first
+            current_time = int(datetime.now().timestamp() * 1000)  # milliseconds
+            score = (priority.value * 1_000_000) + current_time
+            
+            await self._redis.zadd(
+                f"{self.QUEUE_KEY_PREFIX}{queue_name}:tasks",
+                {task_id: score}
+            )
+            
+            logger.info(f"Task {task_id} submitted to queue {queue_name}")
+            return task_info
+    
+    async def _process_queue(self, queue_name: str):
+        """Process tasks in the queue"""
+        worker_pool = self.queues[queue_name]
+        queue_key = f"{self.QUEUE_KEY_PREFIX}{queue_name}:tasks"
         
-        if task_id in worker_pool._tasks:
+        while not self._shutdown_event.is_set():
             try:
-                await asyncio.wait_for(worker_pool._tasks[task_id], timeout=timeout)
-            except asyncio.TimeoutError:
-                logger.warning(f"Task {task_id} timed out after {timeout} seconds")
-                raise
-        
-        return task_info
+                async with worker_pool.processing_semaphore:
+                    # Get highest priority task
+                    next_task = await self._redis.zrange(
+                        queue_key,
+                        0,
+                        0,  # Get only the highest priority task
+                        withscores=True
+                    )
+                    
+                    if not next_task:
+                        await asyncio.sleep(0.1)
+                        continue
+                    
+                    task_id = next_task[0][0]
+                    if isinstance(task_id, bytes):
+                        task_id = task_id.decode('utf-8')
+                    
+                    # Get task info
+                    task_info_data = await self._redis.get(f"{self.TASK_KEY_PREFIX}{task_id}")
+                    if not task_info_data:
+                        await self._redis.zrem(queue_key, task_id)
+                        continue
+                        
+                    task_info = TaskInfo.from_json(task_info_data)
+                    
+                    if task_info.status == TaskStatus.QUEUED:
+                        task_data = worker_pool._tasks.get(task_id)
+                        if not task_data:
+                            continue
 
-    async def wait_for_queue(self, queue_name: str, timeout: Optional[float] = None):
-        """Wait for all tasks in a specific queue to complete"""
+                        func = task_data['func']
+                        args = task_data.get('args', ())
+                        kwargs = task_data.get('kwargs', {})
+                        
+                        # Remove from queue and update status
+                        await self._redis.zrem(queue_key, task_id)
+                        task_info.status = TaskStatus.PROCESSING
+                        await self._redis.set(
+                            f"{self.TASK_KEY_PREFIX}{task_id}",
+                            task_info.to_json(),
+                            ex=self.TASK_EXPIRY_SECONDS
+                        )
+                        
+                        try:
+                            # Execute the task
+                            result = await func(*args, **kwargs)
+                            task_info.status = TaskStatus.COMPLETED
+                            task_info.result = result
+                            task_info.completed_time = datetime.now()
+                            logger.info(f"Task {task_id} completed successfully")
+                        except Exception as e:
+                            task_info.status = TaskStatus.FAILED
+                            task_info.error = str(e)
+                            task_info.completed_time = datetime.now()
+                            logger.error(f"Task {task_id} failed: {str(e)}")
+                        
+                        # Update final status
+                        await self._redis.set(
+                            f"{self.TASK_KEY_PREFIX}{task_id}",
+                            task_info.to_json(),
+                            ex=self.TASK_EXPIRY_SECONDS
+                        )
+                
+            except Exception as e:
+                logger.error(f"Error processing queue {queue_name}: {str(e)}")
+                await asyncio.sleep(1)  # Back off on error
+    async def _handle_task_completion(self, task_id: str, future: asyncio.Future):
+        try:
+            result = future.result()
+            task_info_data = await self._redis.get(f"{self.TASK_KEY_PREFIX}{task_id}")
+            if task_info_data:
+                task_info = TaskInfo.from_json(task_info_data)
+                task_info.status = TaskStatus.COMPLETED
+                task_info.result = result
+                task_info.completed_time = datetime.now()
+                
+                await self._redis.set(
+                    f"{self.TASK_KEY_PREFIX}{task_id}",
+                    task_info.to_json(),
+                    ex=self.TASK_EXPIRY_SECONDS
+                )
+                
+                logger.info(f"Task {task_id} completed successfully")
+                
+        except Exception as e:
+            logger.error(f"Task {task_id} failed: {str(e)}")
+            task_info_data = await self._redis.get(f"{self.TASK_KEY_PREFIX}{task_id}")
+            if task_info_data:
+                task_info = TaskInfo.from_json(task_info_data)
+                task_info.status = TaskStatus.FAILED
+                task_info.error = str(e)
+                task_info.completed_time = datetime.now()
+                
+                await self._redis.set(
+                    f"{self.TASK_KEY_PREFIX}{task_id}",
+                    task_info.to_json(),
+                    ex=self.TASK_EXPIRY_SECONDS
+                )
+
+    async def get_task_status(self, task_id: str) -> TaskInfo:
+        task_data = await self._redis.get(f"{self.TASK_KEY_PREFIX}{task_id}")
+        if not task_data:
+            raise TaskNotFoundError(f"Task {task_id} not found")
+        return TaskInfo.from_json(task_data)
+
+    async def get_queue_status(self, queue_name: str) -> Dict[str, Any]:
         if queue_name not in self.queues:
             raise QueueNotFoundError(f"Queue {queue_name} not found")
-            
+        
         worker_pool = self.queues[queue_name]
-        tasks = list(worker_pool._tasks.values())
+        queue_size = await self._redis.zcard(f"{self.QUEUE_KEY_PREFIX}{queue_name}:tasks")
         
-        if tasks:
-            await asyncio.wait(tasks, timeout=timeout)
+        return {
+            "name": queue_name,
+            "max_workers": worker_pool.config.max_workers,
+            "current_workers": len(worker_pool._tasks),
+            "queued_tasks": queue_size,
+            "circuit_breaker_status": "open" if worker_pool.circuit_breaker.is_open else "closed"
+        }
 
-    def cleanup_old_tasks(self, max_age_hours: int = 24, queue_name: Optional[str] = None):
-        """Clean up completed tasks, optionally for a specific queue"""
-        current_time = datetime.now()
-        cleaned_count = 0
-        with self._lock:
-            for task_id, task_info in list(self.tasks.items()):
-                if queue_name and task_info.queue_name != queue_name:
-                    continue
-                    
-                if task_info.completed_time:
-                    age = current_time - task_info.completed_time
-                    if age.total_seconds() > max_age_hours * 3600:
-                        del self.tasks[task_id]
-                        cleaned_count += 1
-        
-        logger.info(f"Cleaned up {cleaned_count} old tasks")
-
-    async def shutdown(self, wait: bool = True):
-        """Shutdown all queues"""
+    async def shutdown(self, wait: bool = True, timeout: float = 5.0):
         logger.info("Shutting down TaskQueueManager")
+        self._shutdown_event.set()
         
-        # Wait for pending tasks if requested
         if wait:
             for queue_name, worker_pool in self.queues.items():
-                tasks = list(worker_pool._tasks.values())
-                if tasks:
+                worker_pool._shutdown = True
+                active_tasks = []
+                for task_data in worker_pool._tasks.values():
+                    if isinstance(task_data, dict) and task_data.get('task'):
+                        active_tasks.append(task_data['task'])
+                
+                if active_tasks:
                     try:
-                        await asyncio.wait(tasks, timeout=5.0)
+                        await asyncio.wait(active_tasks, timeout=timeout)
                     except Exception as e:
                         logger.error(f"Error waiting for tasks in queue {queue_name}: {str(e)}")
         
-        # Shutdown all worker pools
-        for queue_name, worker_pool in self.queues.items():
-            worker_pool._shutdown = True
-            worker_pool.executor.shutdown(wait=wait)
-            logger.info(f"Shut down queue {queue_name}")
+        if self._redis:
+            await self._redis.close()
+            logger.info("Closed Redis connection")
