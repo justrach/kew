@@ -1,3 +1,4 @@
+from datetime import datetime
 import pytest
 import asyncio
 import random
@@ -276,6 +277,123 @@ async def test_queue_cleanup():
         # Check task was cleaned up
         with pytest.raises(Exception):
             await manager.get_task_status("task1")
+    
+    finally:
+        await manager.shutdown()
+
+@pytest.mark.asyncio
+async def test_task_timing():
+    """Test that task timing information is recorded correctly"""
+    manager = TaskQueueManager(redis_url="redis://localhost:6379", cleanup_on_start=True)
+    await manager.initialize()
+    
+    try:
+        await manager.create_queue(QueueConfig(
+            name="timing_queue",
+            max_workers=1
+        ))
+        
+        # Submit task with known sleep time
+        sleep_duration = 0.2
+        task_info = await manager.submit_task(
+            task_id="timing_task",
+            queue_name="timing_queue",
+            task_type="test",
+            task_func=long_task,
+            priority=QueuePriority.MEDIUM,
+            task_num=1,
+            sleep_time=sleep_duration
+        )
+        
+        # Get initial timestamp
+        initial_status = await manager.get_task_status(task_info.task_id)
+        queued_time = initial_status.queued_time
+        
+        # Wait for completion
+        await asyncio.sleep(sleep_duration + 0.1)  # Add small buffer
+        
+        # Get final status
+        final_status = await manager.get_task_status(task_info.task_id)
+        
+        # Verify timestamps exist and are in correct order
+        assert final_status.started_time is not None, "Start time should be set"
+        assert final_status.completed_time is not None, "Completed time should be set"
+        assert queued_time < final_status.started_time < final_status.completed_time, \
+            "Timestamps should be in order: queued < started < completed"
+        
+        # Verify processing duration is approximately correct
+        processing_duration = (final_status.completed_time - final_status.started_time).total_seconds()
+        assert sleep_duration - 0.1 <= processing_duration <= sleep_duration + 0.1, \
+            f"Processing duration ({processing_duration}) should be close to sleep duration ({sleep_duration})"
+    
+    finally:
+        await manager.shutdown()
+@pytest.mark.asyncio
+async def test_concurrent_processing():
+    """Test that tasks can be processed concurrently up to max_workers"""
+    manager = TaskQueueManager(redis_url="redis://localhost:6379", cleanup_on_start=True)
+    await manager.initialize()
+    
+    try:
+        # Create queue with 3 workers
+        await manager.create_queue(QueueConfig(
+            name="concurrent_queue",
+            max_workers=3,
+            priority=QueuePriority.MEDIUM
+        ))
+        
+        start_time = datetime.now()
+        execution_times = {}
+        
+        async def tracked_task(task_num: int, sleep_time: float):
+            execution_times[task_num] = {
+                'start': datetime.now(),
+                'sleep_time': sleep_time
+            }
+            await asyncio.sleep(sleep_time)
+            execution_times[task_num]['end'] = datetime.now()
+            return f"Task {task_num} completed"
+        
+        # Submit 4 tasks, each taking 0.5 seconds
+        tasks = []
+        for i in range(4):
+            task_info = await manager.submit_task(
+                task_id=f"concurrent_task_{i}",
+                queue_name="concurrent_queue",
+                task_type="test",
+                task_func=tracked_task,
+                priority=QueuePriority.MEDIUM,
+                task_num=i,
+                sleep_time=0.5
+            )
+            tasks.append(task_info)
+        
+        # Wait for all tasks to complete
+        await asyncio.sleep(1.2)  # Should be enough time for all tasks with concurrent processing
+        
+        # Verify all tasks completed
+        for task in tasks:
+            status = await manager.get_task_status(task.task_id)
+            assert status.status == TaskStatus.COMPLETED
+        
+        # Verify concurrent execution
+        # First 3 tasks should start at almost the same time
+        # Fourth task should start after one of the first 3 finishes
+        start_times = [execution_times[i]['start'] for i in range(4)]
+        start_times.sort()
+        
+        # First 3 tasks should start within 0.1s of each other
+        assert (start_times[2] - start_times[0]).total_seconds() < 0.1, \
+            "First 3 tasks should start almost simultaneously"
+        
+        # Fourth task should start after about 0.5s (when first task finishes)
+        assert 0.4 < (start_times[3] - start_times[0]).total_seconds() < 0.6, \
+            "Fourth task should start after one of the first tasks completes"
+        
+        # Total execution time should be about 1 second (two batches of 0.5s)
+        total_time = (datetime.now() - start_time).total_seconds()
+        assert 0.9 < total_time < 1.3, \
+            f"Expected total execution time around 1 second, got {total_time}"
     
     finally:
         await manager.shutdown()

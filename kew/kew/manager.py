@@ -176,16 +176,22 @@ class TaskQueueManager:
         
         while not self._shutdown_event.is_set():
             try:
-                async with worker_pool.processing_semaphore:
-                    # Get highest priority task
+                # Try to acquire a worker slot
+                if not await worker_pool.processing_semaphore.acquire():
+                    await asyncio.sleep(0.1)
+                    continue
+                    
+                try:
                     next_task = await self._redis.zrange(
                         queue_key,
                         0,
-                        0,  # Get only the highest priority task
+                        0,
                         withscores=True
                     )
                     
                     if not next_task:
+                        # Release the semaphore if no task is available
+                        worker_pool.processing_semaphore.release()
                         await asyncio.sleep(0.1)
                         continue
                     
@@ -193,9 +199,9 @@ class TaskQueueManager:
                     if isinstance(task_id, bytes):
                         task_id = task_id.decode('utf-8')
                     
-                    # Get task info
                     task_info_data = await self._redis.get(f"{self.TASK_KEY_PREFIX}{task_id}")
                     if not task_info_data:
+                        worker_pool.processing_semaphore.release()
                         await self._redis.zrem(queue_key, task_id)
                         continue
                         
@@ -204,47 +210,46 @@ class TaskQueueManager:
                     if task_info.status == TaskStatus.QUEUED:
                         task_data = worker_pool._tasks.get(task_id)
                         if not task_data:
+                            worker_pool.processing_semaphore.release()
                             continue
 
                         func = task_data['func']
                         args = task_data.get('args', ())
                         kwargs = task_data.get('kwargs', {})
                         
-                        # Remove from queue and update status
                         await self._redis.zrem(queue_key, task_id)
                         task_info.status = TaskStatus.PROCESSING
+                        task_info.started_time = datetime.now()
+                        
                         await self._redis.set(
                             f"{self.TASK_KEY_PREFIX}{task_id}",
                             task_info.to_json(),
                             ex=self.TASK_EXPIRY_SECONDS
                         )
                         
-                        try:
-                            # Execute the task
-                            result = await func(*args, **kwargs)
-                            task_info.status = TaskStatus.COMPLETED
-                            task_info.result = result
-                            task_info.completed_time = datetime.now()
-                            logger.info(f"Task {task_id} completed successfully")
-                        except Exception as e:
-                            task_info.status = TaskStatus.FAILED
-                            task_info.error = str(e)
-                            task_info.completed_time = datetime.now()
-                            logger.error(f"Task {task_id} failed: {str(e)}")
+                        # Create task and store it
+                        task = asyncio.create_task(self._execute_task(task_id, func, args, kwargs))
+                        worker_pool._tasks[task_id]['task'] = task
                         
-                        # Update final status
-                        await self._redis.set(
-                            f"{self.TASK_KEY_PREFIX}{task_id}",
-                            task_info.to_json(),
-                            ex=self.TASK_EXPIRY_SECONDS
+                        # Add callback to release semaphore when task completes
+                        task.add_done_callback(
+                            lambda _: worker_pool.processing_semaphore.release()
                         )
+                    else:
+                        worker_pool.processing_semaphore.release()
                 
+                except Exception as e:
+                    worker_pool.processing_semaphore.release()
+                    logger.error(f"Error processing task in queue {queue_name}: {str(e)}")
+                    await asyncio.sleep(1)
+                    
             except Exception as e:
-                logger.error(f"Error processing queue {queue_name}: {str(e)}")
-                await asyncio.sleep(1)  # Back off on error
-    async def _handle_task_completion(self, task_id: str, future: asyncio.Future):
+                logger.error(f"Error in queue {queue_name}: {str(e)}")
+                await asyncio.sleep(1)
+    async def _execute_task(self, task_id: str, func: Callable, args: tuple, kwargs: dict):
+        """Execute a single task and update its status"""
         try:
-            result = future.result()
+            result = await func(*args, **kwargs)
             task_info_data = await self._redis.get(f"{self.TASK_KEY_PREFIX}{task_id}")
             if task_info_data:
                 task_info = TaskInfo.from_json(task_info_data)
@@ -257,7 +262,6 @@ class TaskQueueManager:
                     task_info.to_json(),
                     ex=self.TASK_EXPIRY_SECONDS
                 )
-                
                 logger.info(f"Task {task_id} completed successfully")
                 
         except Exception as e:
@@ -274,7 +278,6 @@ class TaskQueueManager:
                     task_info.to_json(),
                     ex=self.TASK_EXPIRY_SECONDS
                 )
-
     async def get_task_status(self, task_id: str) -> TaskInfo:
         task_data = await self._redis.get(f"{self.TASK_KEY_PREFIX}{task_id}")
         if not task_data:
@@ -317,3 +320,16 @@ class TaskQueueManager:
         if self._redis:
             await self._redis.close()
             logger.info("Closed Redis connection")
+    async def get_ongoing_tasks(self) -> List[TaskInfo]:
+        """Get all tasks that are currently being processed."""
+        ongoing_tasks = []
+        
+        # Scan through all task keys
+        async for key in self._redis.scan_iter(f"{self.TASK_KEY_PREFIX}*"):
+            task_data = await self._redis.get(key)
+            if task_data:
+                task_info = TaskInfo.from_json(task_data)
+                if task_info.status == TaskStatus.PROCESSING:
+                    ongoing_tasks.append(task_info)
+        
+        return ongoing_tasks
