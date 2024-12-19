@@ -2,7 +2,6 @@
 
 ![PyPI Downloads](https://static.pepy.tech/badge/kew) ![Github Actions](https://github.com/justrach/kew/actions/workflows/python-package.yml/badge.svg)
 
-A Redis-backed task queue built for modern async Python applications...
 A Redis-backed task queue built for modern async Python applications. Handles background processing with precise concurrency control, priority queues, and circuit breakers - all running in your existing async process.
 
 ## Why Kew?
