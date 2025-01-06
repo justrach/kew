@@ -1,7 +1,17 @@
-# Kew: Modern Async Task Queue
+<p align="center">
+  <img src="https://github.com/justrach/kew/blob/main/kew_logo.jpg" alt="Kew Logo" width="200"/>
+</p>
 
-![PyPI Downloads](https://static.pepy.tech/badge/kew) ![Github Actions](https://github.com/justrach/kew/actions/workflows/python-package.yml/badge.svg)
+<h1 align="center">Kew: Modern Async Task Queue</h1>
 
+<p align="center">
+  <a href="https://pypi.org/project/kew">
+    <img src="https://static.pepy.tech/badge/kew" alt="PyPI Downloads">
+  </a>
+  <a href="https://github.com/justrach/kew/actions/workflows/python-package.yml">
+    <img src="https://github.com/justrach/kew/actions/workflows/python-package.yml/badge.svg" alt="Github Actions">
+  </a>
+</p>
 A Redis-backed task queue built for modern async Python applications. Handles background processing with precise concurrency control, priority queues, and circuit breakers - all running in your existing async process.
 
 ## Why Kew?
