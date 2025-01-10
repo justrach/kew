@@ -1,6 +1,20 @@
 
 # Kew Performance Benchmark Results
 
+
+## System Information
+
+| Component | Details |
+|-----------|---------|
+| Operating System | Darwin Darwin Kernel Version 24.1.0: Thu Nov 14 18:15:21 PST 2024; root:xnu-11215.41.3~13/RELEASE_ARM64_T6041 |
+| Python Version | 3.12.5 |
+| Processor | arm |
+| CPU Cores | 14 |
+| CPU Frequency | 4.00MHz |
+| Total Memory | 48.0GB |
+| Available Memory | 16.0GB |
+
+
 ## System Performance
 
 The following benchmarks were run with:
@@ -9,46 +23,46 @@ The following benchmarks were run with:
 - Multiple computational workloads
 
 ### Overall Performance
-- Total Duration: 22.04 seconds
-- Overall Throughput: 4.54 tasks/second
+- Total Duration: 22.30 seconds
+- Overall Throughput: 4.48 tasks/second
 
 ### Task-Specific Performance
 
 ### Large Matrix Multiplication (1000x1000)
 | Metric | Value |
 |--------|-------|
-| Average Latency | 17.815s |
-| Median Latency | 17.849s |
-| 95th Percentile | 18.208s |
-| 99th Percentile | 18.209s |
-| Throughput | 1.13 tasks/second |
+| Average Latency | 17.681s |
+| Median Latency | 17.696s |
+| 95th Percentile | 18.040s |
+| 99th Percentile | 18.049s |
+| Throughput | 1.12 tasks/second |
 
 ### Heavy Prime Calculation (up to 10M)
 | Metric | Value |
 |--------|-------|
-| Average Latency | 18.581s |
-| Median Latency | 18.555s |
-| 95th Percentile | 18.863s |
-| 99th Percentile | 18.863s |
-| Throughput | 1.13 tasks/second |
+| Average Latency | 18.409s |
+| Median Latency | 18.390s |
+| 95th Percentile | 18.734s |
+| 99th Percentile | 18.743s |
+| Throughput | 1.12 tasks/second |
 
 ### Complex FFT (10M points)
 | Metric | Value |
 |--------|-------|
-| Average Latency | 16.033s |
-| Median Latency | 15.951s |
-| 95th Percentile | 18.436s |
-| 99th Percentile | 18.979s |
-| Throughput | 1.13 tasks/second |
+| Average Latency | 16.209s |
+| Median Latency | 15.958s |
+| 95th Percentile | 18.852s |
+| 99th Percentile | 18.861s |
+| Throughput | 1.12 tasks/second |
 
 ### Distributed Data Processing
 | Metric | Value |
 |--------|-------|
-| Average Latency | 8.800s |
-| Median Latency | 8.981s |
-| 95th Percentile | 11.974s |
-| 99th Percentile | 12.649s |
-| Throughput | 1.13 tasks/second |
+| Average Latency | 9.173s |
+| Median Latency | 9.349s |
+| 95th Percentile | 12.984s |
+| 99th Percentile | 12.985s |
+| Throughput | 1.12 tasks/second |
 
 
 ## Load Distribution
@@ -61,23 +75,23 @@ Testing load distribution across multiple queues with:
 ### Queue Performance
 
 #### Queue: load_test_queue_0
-- Tasks processed: 78
-- Average execution time: 0.384s
+- Tasks processed: 73
+- Average execution time: 0.378s
 
 #### Queue: load_test_queue_1
-- Tasks processed: 74
-- Average execution time: 0.388s
+- Tasks processed: 69
+- Average execution time: 0.382s
 
 #### Queue: load_test_queue_2
-- Tasks processed: 74
-- Average execution time: 0.388s
+- Tasks processed: 66
+- Average execution time: 0.389s
 
 
-### Load Balance Score: 0.004s
+### Load Balance Score: 0.011s
 (Lower score indicates better load distribution)
 
 ---
-*Benchmark run on 2025-01-10 17:16:56*
+*Benchmark run on 2025-01-10 17:19:50*
 
 ## Extended Performance Comparison
 
@@ -85,8 +99,8 @@ Testing load distribution across multiple queues with:
 
 | Queue System | Total Duration (s) | Throughput (tasks/s) | Recovery from Failures | Data Persistence |
 |--------------|-------------------|---------------------|---------------------|------------------|
-| Kew | 22.04 | 4.54 | Yes | Yes |
-| asyncio.Queue | 42.74 | 4.68 | No | No |
+| Kew | 22.30 | 4.48 | Yes | Yes |
+| asyncio.Queue | 43.71 | 4.58 | No | No |
 | multiprocessing.Queue | ERROR | ERROR | Limited | No |
 
 ### Error Notes

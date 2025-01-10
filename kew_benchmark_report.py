@@ -10,6 +10,9 @@ from multiprocessing import Process, Queue as MPQueue
 from asyncio import Queue as AsyncQueue
 from concurrent.futures import ProcessPoolExecutor
 import os
+import platform
+import psutil
+import multiprocessing
 
 async def matrix_multiplication(size: int = 100) -> dict:
     """Perform matrix multiplication - O(n³) complexity"""
@@ -227,7 +230,41 @@ async def dummy_task(task_num: int, sleep_time: float = 0.1) -> dict:
     await asyncio.sleep(sleep_time)
     return {"task_num": task_num, "processed_at": time.time()}
 
+def get_system_info():
+    """Get system information for benchmarking context"""
+    memory = psutil.virtual_memory()
+    cpu_freq = psutil.cpu_freq()
+    
+    return {
+        'os': platform.system(),
+        'os_version': platform.version(),
+        'python_version': platform.python_version(),
+        'processor': platform.processor(),
+        'cpu_cores': multiprocessing.cpu_count(),
+        'cpu_freq': f"{cpu_freq.current:.2f}MHz" if cpu_freq else "Unknown",
+        'memory_total': f"{memory.total / (1024**3):.1f}GB",
+        'memory_available': f"{memory.available / (1024**3):.1f}GB",
+    }
+
 def generate_markdown_report(perf_results, load_results):
+    # Get system information
+    sys_info = get_system_info()
+    
+    # Add system info section to the markdown
+    system_info_md = f"""
+## System Information
+
+| Component | Details |
+|-----------|---------|
+| Operating System | {sys_info['os']} {sys_info['os_version']} |
+| Python Version | {sys_info['python_version']} |
+| Processor | {sys_info['processor']} |
+| CPU Cores | {sys_info['cpu_cores']} |
+| CPU Frequency | {sys_info['cpu_freq']} |
+| Total Memory | {sys_info['memory_total']} |
+| Available Memory | {sys_info['memory_available']} |
+"""
+
     task_metrics_md = "\n".join([
         f"### {task_name}\n"
         f"| Metric | Value |\n"
@@ -242,6 +279,8 @@ def generate_markdown_report(perf_results, load_results):
 
     markdown = f"""
 # Kew Performance Benchmark Results
+
+{system_info_md}
 
 ## System Performance
 
