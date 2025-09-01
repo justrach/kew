@@ -4,10 +4,11 @@ from .exceptions import (
     TaskQueueError, 
     TaskAlreadyExistsError, 
     TaskNotFoundError,
-    QueueNotFoundError
+    QueueNotFoundError,
+    QueueProcessorError
 )
 
-__version__ = "0.1.0"
+__version__ = "0.1.5"
 __all__ = [
     "TaskQueueManager",
     "TaskStatus",
@@ -17,5 +18,6 @@ __all__ = [
     "TaskQueueError",
     "TaskAlreadyExistsError",
     "TaskNotFoundError",
-    "QueueNotFoundError"
+    "QueueNotFoundError",
+    "QueueProcessorError"
 ]

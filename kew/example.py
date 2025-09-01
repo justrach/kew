@@ -8,15 +8,16 @@ async def example_task(x: int):
 async def main():
     # Create manager
     manager = TaskQueueManager()
+    await manager.initialize()
     
     # Create queues
-    manager.create_queue(QueueConfig(
+    await manager.create_queue(QueueConfig(
         name="critical",
         max_workers=4,
         priority=QueuePriority.HIGH
     ))
     
-    manager.create_queue(QueueConfig(
+    await manager.create_queue(QueueConfig(
         name="background",
         max_workers=1,
         priority=QueuePriority.LOW
@@ -43,20 +44,20 @@ async def main():
     
     # Get initial queue statuses
     print("\nInitial Queue Statuses:")
-    print("Critical Queue:", manager.get_queue_status("critical"))
-    print("Background Queue:", manager.get_queue_status("background"))
+    print("Critical Queue:", await manager.get_queue_status("critical"))
+    print("Background Queue:", await manager.get_queue_status("background"))
     
     # Wait for tasks to complete
     await asyncio.sleep(2)
     
     # Get final queue statuses
     print("\nFinal Queue Statuses:")
-    print("Critical Queue:", manager.get_queue_status("critical"))
-    print("Background Queue:", manager.get_queue_status("background"))
+    print("Critical Queue:", await manager.get_queue_status("critical"))
+    print("Background Queue:", await manager.get_queue_status("background"))
     
     # Get task results
-    task1_status = manager.get_task_status("task1")
-    task2_status = manager.get_task_status("task2")
+    task1_status = await manager.get_task_status("task1")
+    task2_status = await manager.get_task_status("task2")
     
     print("\nTask Results:")
     print(f"Task 1 (Critical): {task1_status.result}")

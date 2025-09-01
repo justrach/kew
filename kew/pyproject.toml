@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kew"
-version = "0.1.4"
+version = "0.1.5"
 authors = [
   { name="Rach Pradhan", email="rach@rachit.ai" },
 ]
@@ -23,10 +23,6 @@ classifiers = [
 keywords = ["async", "queue", "task", "manager", "concurrent", "redis"]
 dependencies = [
     "redis>=5.0.0",
-    "aioredis>=2.0.0",
-    "asyncio>=3.4.3",
-    "typing-extensions>=4.0.0",
-    "pydantic>=2.0.0",
 ]
 
 [project.optional-dependencies]
@@ -55,7 +51,7 @@ packages = ["kew"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
-testpaths = ["tests"]
+testpaths = ["kew/tests"]
 python_files = ["test_*.py"]
 addopts = "-v --cov=kew"
 

@@ -61,7 +61,7 @@ pip install kew
 2. Create a simple task processor:
 ```python
 import asyncio
-from kew import TaskQueueManager, QueueConfig
+from kew import TaskQueueManager, QueueConfig, QueuePriority
 
 async def process_order(order_id: str):
     # Simulate order processing
@@ -86,12 +86,16 @@ async def main():
         task = await manager.submit_task(
             task_id=f"order-{i}",
             queue_name="orders",
+            task_type="process_order",
             task_func=process_order,
+            priority=QueuePriority.MEDIUM,
             order_id=str(i)
         )
         tasks.append(task)
     
     # Check results
+    # Small delay to allow tasks to complete in this simple example
+    await asyncio.sleep(1.2)
     for task in tasks:
         status = await manager.get_task_status(task.task_id)
         print(f"{task.task_id}: {status.result}")
@@ -105,7 +109,7 @@ if __name__ == "__main__":
 ### Async Web Application
 ```python
 from fastapi import FastAPI
-from kew import TaskQueueManager, QueueConfig
+from kew import TaskQueueManager, QueueConfig, QueuePriority
 
 app = FastAPI()
 manager = TaskQueueManager()
@@ -127,7 +131,9 @@ async def signup(email: str):
     await manager.submit_task(
         task_id=f"welcome-{user.id}",
         queue_name="emails",
+        task_type="send_welcome_email",
         task_func=send_welcome_email,
+        priority=QueuePriority.MEDIUM,
         user_id=user.id
     )
     return {"status": "success"}
@@ -157,7 +163,9 @@ async def process_batch(items: list):
         await manager.submit_task(
             task_id=f"item-{item.id}",
             queue_name="critical",
+            task_type="process_item",
             task_func=process_item,
+            priority=QueuePriority.HIGH,
             item=item
         )
     
@@ -166,7 +174,9 @@ async def process_batch(items: list):
         await manager.submit_task(
             task_id=f"item-{item.id}",
             queue_name="batch",
+            task_type="process_item",
             task_func=process_item,
+            priority=QueuePriority.LOW,
             item=item
         )
 ```
@@ -198,14 +208,10 @@ await manager.create_queue(QueueConfig(
 ```
 
 ### Circuit Breakers
-```python
-# Configure circuit breaker for external API calls
-await manager.create_queue(QueueConfig(
-    name="api_calls",
-    circuit_breaker_max_failures=5,  # Open after 5 failures
-    circuit_breaker_reset_timeout=30  # Reset after 30 seconds
-))
-```
+Built-in per-queue circuit breaker tracks consecutive failures and temporarily opens the circuit to protect downstreams.
+
+- Defaults: `max_failures=3`, `reset_timeout=60s`
+- Note: Currently not configurable via `QueueConfig`.
 
 ### Task Monitoring
 ```python
@@ -221,6 +227,38 @@ print(f"Active Tasks: {queue_status['current_workers']}")
 print(f"Circuit Breaker: {queue_status['circuit_breaker_status']}")
 ```
 
+## Performance & Reliability (v0.1.5)
+
+- Reduced worker-loop idle delay (from 100ms to 20ms) for faster task pickup and lower test flakiness.
+- Graceful shutdown: awaits active tasks, flushes callbacks, and uses Redis `aclose()` to avoid deprecation warnings and lost updates.
+- Requires Redis 7 locally and in CI.
+
+## Version Differences
+
+See the full changelog in [CHANGELOG.md](CHANGELOG.md).
+
+- 0.1.5 (current)
+  - Faster task pickup (idle delay 100ms → 20ms)
+  - More reliable shutdown (await tasks, flush callbacks, Redis `aclose()`)
+  - Tests: 7/7 passing; coverage gate restored to 80% (total ~87%)
+  - Docs: examples aligned with async API (`task_type`, `priority`)
+  - CI: Redis 7 service; pip cache; simplified install
+- 0.1.4
+  - Stable async queues, priorities, and concurrency control
+  - Circuit breaker defaults (3 failures, 60s reset)
+  - Known issues: longer idle delay could leave tasks in PROCESSING briefly; Redis `close()` deprecation warnings
+
+## Roadmap
+
+- Make circuit breaker settings configurable per queue (max failures, reset timeout)
+- Configurable task expiry and queue polling intervals (idle delay)
+- Retry and backoff policies with dead-letter queue
+- Pause/resume controls and basic admin/health endpoints
+- Metrics and observability (Prometheus/OpenTelemetry), richer `get_queue_status()`
+- Distributed workers with coordination (locks) for multi-process scaling
+- Rate limiting per queue and burst control
+- CLI tooling for inspection and maintenance
+
 ## Configuration
 
 ### Redis Settings
@@ -232,13 +270,7 @@ manager = TaskQueueManager(
 ```
 
 ### Task Expiration
-```python
-# Tasks expire after 24 hours by default
-# Configure custom expiration:
-manager = TaskQueueManager(
-    task_expiry_seconds=3600  # 1 hour
-)
-```
+Tasks expire after 24 hours by default. This value is currently not configurable.
 
 ## Error Handling
 

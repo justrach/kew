@@ -67,12 +67,13 @@ class TaskQueueManager:
         self._setup_logging()
 
     def _setup_logging(self):
-        handler = logging.StreamHandler()
-        formatter = logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        )
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            )
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
         logger.setLevel(logging.INFO)
 
     async def initialize(self):
@@ -132,7 +133,19 @@ class TaskQueueManager:
         async with self._lock:
             if queue_name not in self.queues:
                 raise QueueNotFoundError(f"Queue {queue_name} not found")
-            
+            worker_pool = self.queues[queue_name]
+            queue_key = f"{self.QUEUE_KEY_PREFIX}{queue_name}:tasks"
+
+            # Enforce max queue size (backpressure)
+            queue_len = await self._redis.zcard(queue_key)
+            if queue_len >= worker_pool.config.max_size:
+                raise QueueProcessorError(f"Queue {queue_name} is full (max_size={worker_pool.config.max_size})")
+
+            # Duplicate protection by task_id
+            existing = await self._redis.get(f"{self.TASK_KEY_PREFIX}{task_id}")
+            if existing is not None:
+                raise TaskAlreadyExistsError(f"Task {task_id} already exists")
+
             task_info = TaskInfo(
                 task_id=task_id,
                 task_type=task_type,
@@ -140,7 +153,8 @@ class TaskQueueManager:
                 priority=priority.value
             )
             
-            self.queues[queue_name]._tasks[task_id] = {
+            # Store function and args for local execution
+            worker_pool._tasks[task_id] = {
                 'func': task_func,
                 'args': args,
                 'kwargs': kwargs,
@@ -162,7 +176,7 @@ class TaskQueueManager:
             score = (priority.value * 1_000_000) + current_time
             
             await self._redis.zadd(
-                f"{self.QUEUE_KEY_PREFIX}{queue_name}:tasks",
+                queue_key,
                 {task_id: score}
             )
             
@@ -176,33 +190,32 @@ class TaskQueueManager:
         
         while not self._shutdown_event.is_set():
             try:
-                # Try to acquire a worker slot
-                if not await worker_pool.processing_semaphore.acquire():
-                    await asyncio.sleep(0.1)
+                # Skip processing if circuit is open
+                if not await worker_pool.circuit_breaker.check_state():
+                    await asyncio.sleep(0.5)
                     continue
-                    
+
+                # Acquire a worker slot (blocks until available)
+                await worker_pool.processing_semaphore.acquire()
+
                 try:
-                    next_task = await self._redis.zrange(
-                        queue_key,
-                        0,
-                        0,
-                        withscores=True
-                    )
-                    
-                    if not next_task:
+                    # Atomically pop the next task by priority
+                    popped = await self._redis.zpopmin(queue_key, 1)
+
+                    if not popped:
                         # Release the semaphore if no task is available
                         worker_pool.processing_semaphore.release()
-                        await asyncio.sleep(0.1)
+                        # Lower idle delay to improve responsiveness
+                        await asyncio.sleep(0.02)
                         continue
-                    
-                    task_id = next_task[0][0]
+
+                    task_id = popped[0][0]
                     if isinstance(task_id, bytes):
                         task_id = task_id.decode('utf-8')
-                    
+
                     task_info_data = await self._redis.get(f"{self.TASK_KEY_PREFIX}{task_id}")
                     if not task_info_data:
                         worker_pool.processing_semaphore.release()
-                        await self._redis.zrem(queue_key, task_id)
                         continue
                         
                     task_info = TaskInfo.from_json(task_info_data)
@@ -216,8 +229,6 @@ class TaskQueueManager:
                         func = task_data['func']
                         args = task_data.get('args', ())
                         kwargs = task_data.get('kwargs', {})
-                        
-                        await self._redis.zrem(queue_key, task_id)
                         task_info.status = TaskStatus.PROCESSING
                         task_info.started_time = datetime.now()
                         
@@ -232,9 +243,14 @@ class TaskQueueManager:
                         worker_pool._tasks[task_id]['task'] = task
                         
                         # Add callback to release semaphore when task completes
-                        task.add_done_callback(
-                            lambda _: worker_pool.processing_semaphore.release()
-                        )
+                        def _on_done(_):
+                            try:
+                                # Cleanup local task store to prevent memory growth
+                                worker_pool._tasks.pop(task_id, None)
+                            finally:
+                                worker_pool.processing_semaphore.release()
+
+                        task.add_done_callback(_on_done)
                     else:
                         worker_pool.processing_semaphore.release()
                 
@@ -249,7 +265,20 @@ class TaskQueueManager:
     async def _execute_task(self, task_id: str, func: Callable, args: tuple, kwargs: dict):
         """Execute a single task and update its status"""
         try:
-            result = await func(*args, **kwargs)
+            # Determine timeout from queue config
+            task_info_data_pre = await self._redis.get(f"{self.TASK_KEY_PREFIX}{task_id}")
+            queue_name = None
+            timeout = None
+            if task_info_data_pre:
+                ti = TaskInfo.from_json(task_info_data_pre)
+                queue_name = ti.queue_name
+                if queue_name in self.queues:
+                    timeout = self.queues[queue_name].config.task_timeout
+
+            if timeout and timeout > 0:
+                result = await asyncio.wait_for(func(*args, **kwargs), timeout=timeout)
+            else:
+                result = await func(*args, **kwargs)
             task_info_data = await self._redis.get(f"{self.TASK_KEY_PREFIX}{task_id}")
             if task_info_data:
                 task_info = TaskInfo.from_json(task_info_data)
@@ -263,7 +292,29 @@ class TaskQueueManager:
                     ex=self.TASK_EXPIRY_SECONDS
                 )
                 logger.info(f"Task {task_id} completed successfully")
+                # Reset circuit breaker on success
+                if queue_name and queue_name in self.queues:
+                    await self.queues[queue_name].circuit_breaker.reset()
                 
+        except asyncio.TimeoutError:
+            logger.error(f"Task {task_id} timed out")
+            task_info_data = await self._redis.get(f"{self.TASK_KEY_PREFIX}{task_id}")
+            if task_info_data:
+                task_info = TaskInfo.from_json(task_info_data)
+                task_info.status = TaskStatus.FAILED
+                task_info.error = "Task timed out"
+                task_info.completed_time = datetime.now()
+                await self._redis.set(
+                    f"{self.TASK_KEY_PREFIX}{task_id}",
+                    task_info.to_json(),
+                    ex=self.TASK_EXPIRY_SECONDS
+                )
+            # Record failure in circuit breaker
+            task_info_data_pre = await self._redis.get(f"{self.TASK_KEY_PREFIX}{task_id}")
+            if task_info_data_pre:
+                ti = TaskInfo.from_json(task_info_data_pre)
+                if ti.queue_name in self.queues:
+                    await self.queues[ti.queue_name].circuit_breaker.record_failure()
         except Exception as e:
             logger.error(f"Task {task_id} failed: {str(e)}")
             task_info_data = await self._redis.get(f"{self.TASK_KEY_PREFIX}{task_id}")
@@ -278,6 +329,12 @@ class TaskQueueManager:
                     task_info.to_json(),
                     ex=self.TASK_EXPIRY_SECONDS
                 )
+            # Record failure in circuit breaker
+            task_info_data_pre = await self._redis.get(f"{self.TASK_KEY_PREFIX}{task_id}")
+            if task_info_data_pre:
+                ti = TaskInfo.from_json(task_info_data_pre)
+                if ti.queue_name in self.queues:
+                    await self.queues[ti.queue_name].circuit_breaker.record_failure()
     async def get_task_status(self, task_id: str) -> TaskInfo:
         task_data = await self._redis.get(f"{self.TASK_KEY_PREFIX}{task_id}")
         if not task_data:
@@ -294,7 +351,8 @@ class TaskQueueManager:
         return {
             "name": queue_name,
             "max_workers": worker_pool.config.max_workers,
-            "current_workers": len(worker_pool._tasks),
+            # Approximate active workers as max - available semaphore permits
+            "current_workers": worker_pool.config.max_workers - worker_pool.processing_semaphore._value,
             "queued_tasks": queue_size,
             "circuit_breaker_status": "open" if worker_pool.circuit_breaker.is_open else "closed"
         }
@@ -313,12 +371,16 @@ class TaskQueueManager:
                 
                 if active_tasks:
                     try:
+                        # Give active tasks a chance to complete
                         await asyncio.wait(active_tasks, timeout=timeout)
                     except Exception as e:
                         logger.error(f"Error waiting for tasks in queue {queue_name}: {str(e)}")
+            # Allow done callbacks to run and persist final statuses
+            await asyncio.sleep(0.05)
         
         if self._redis:
-            await self._redis.close()
+            # Use aclose() to properly close async Redis client
+            await self._redis.aclose()
             logger.info("Closed Redis connection")
     async def get_ongoing_tasks(self) -> List[TaskInfo]:
         """Get all tasks that are currently being processed."""
