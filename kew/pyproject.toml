@@ -54,6 +54,7 @@ asyncio_mode = "strict"
 testpaths = ["kew/tests"]
 python_files = ["test_*.py"]
 addopts = "-v --cov=kew"
+asyncio_default_fixture_loop_scope = "function"
 
 [tool.coverage.run]
 source = ["kew"]
