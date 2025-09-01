@@ -238,19 +238,17 @@ class TaskQueueManager:
                             ex=self.TASK_EXPIRY_SECONDS
                         )
                         
-                        # Create task and store it
-                        task = asyncio.create_task(self._execute_task(task_id, func, args, kwargs))
-                        worker_pool._tasks[task_id]['task'] = task
-                        
-                        # Add callback to release semaphore when task completes
-                        def _on_done(_):
+                        # Create a wrapper to run the task and reliably release the semaphore
+                        async def _runner(tid: str, f: Callable, a: tuple, kw: dict):
                             try:
-                                # Cleanup local task store to prevent memory growth
-                                worker_pool._tasks.pop(task_id, None)
+                                await self._execute_task(tid, f, a, kw)
                             finally:
+                                # Cleanup and release a worker slot regardless of outcome
+                                worker_pool._tasks.pop(tid, None)
                                 worker_pool.processing_semaphore.release()
 
-                        task.add_done_callback(_on_done)
+                        task = asyncio.create_task(_runner(task_id, func, args, kwargs))
+                        worker_pool._tasks[task_id]['task'] = task
                     else:
                         worker_pool.processing_semaphore.release()
                 
