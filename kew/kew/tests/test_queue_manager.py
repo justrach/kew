@@ -130,33 +130,43 @@ async def test_multiple_queues():
     finally:
         await manager.shutdown()
 
+async def priority_task_func(priority_name: str, redis_url: str):
+    """Task function that stores execution order in Redis"""
+    import redis.asyncio as redis_async
+    r = await redis_async.from_url(redis_url, encoding="utf-8", decode_responses=True)
+    try:
+        await r.rpush("execution_order", priority_name)
+    finally:
+        await r.aclose()
+    return f"Completed {priority_name}"
+
+
 @pytest.mark.asyncio
 async def test_queue_priorities():
     """Test that high priority tasks are processed before lower priority ones when available"""
-    manager = TaskQueueManager(redis_url="redis://localhost:6379", cleanup_on_start=True)
+    redis_url = "redis://localhost:6379"
+    manager = TaskQueueManager(redis_url=redis_url, cleanup_on_start=True)
     await manager.initialize()
     
     try:
+        # Clean up execution_order from previous runs
+        await manager._redis.delete("execution_order")
+        
         await manager.create_queue(QueueConfig(
             name="priority_queue",
             max_workers=1,
             priority=QueuePriority.MEDIUM
         ))
 
-        execution_order = []
-
-        async def priority_task(priority_name: str):
-            execution_order.append(priority_name)
-            return f"Completed {priority_name}"
-
         # Submit low priority task first - it should start processing
         low_task = await manager.submit_task(
             task_id="low_priority",
             queue_name="priority_queue",
             task_type="test",
-            task_func=priority_task,
+            task_func=priority_task_func,
             priority=QueuePriority.LOW,
-            priority_name="low"
+            priority_name="low",
+            redis_url=redis_url
         )
 
         # Give it a moment to start processing
@@ -167,18 +177,20 @@ async def test_queue_priorities():
             task_id="high_priority",
             queue_name="priority_queue",
             task_type="test",
-            task_func=priority_task,
+            task_func=priority_task_func,
             priority=QueuePriority.HIGH,
-            priority_name="high"
+            priority_name="high",
+            redis_url=redis_url
         )
 
         medium_task = await manager.submit_task(
             task_id="medium_priority",
             queue_name="priority_queue",
             task_type="test",
-            task_func=priority_task,
+            task_func=priority_task_func,
             priority=QueuePriority.MEDIUM,
-            priority_name="medium"
+            priority_name="medium",
+            redis_url=redis_url
         )
 
         # Wait for all tasks to complete
@@ -194,6 +206,10 @@ async def test_queue_priorities():
                 break
             await asyncio.sleep(0.1)
 
+        # Get execution order from Redis
+        execution_order = await manager._redis.lrange("execution_order", 0, -1)
+        execution_order = [item.decode('utf-8') if isinstance(item, bytes) else item for item in execution_order]
+        
         # Verify that high priority tasks are processed before lower priority ones
         # when they're available at the same time
         assert len(execution_order) == 3, f"Expected 3 tasks, got {len(execution_order)}"
@@ -328,13 +344,38 @@ async def test_task_timing():
     
     finally:
         await manager.shutdown()
+async def tracked_task_func(task_num: int, sleep_time: float, redis_url: str):
+    """Task function that tracks execution timing in Redis"""
+    import redis.asyncio as redis_async
+    from datetime import datetime
+    
+    r = await redis_async.from_url(redis_url, encoding="utf-8", decode_responses=True)
+    try:
+        start_timestamp = datetime.now().timestamp()
+        await r.hset(f"execution_time:{task_num}", "start", start_timestamp)
+        await r.hset(f"execution_time:{task_num}", "sleep_time", sleep_time)
+        
+        await asyncio.sleep(sleep_time)
+        
+        end_timestamp = datetime.now().timestamp()
+        await r.hset(f"execution_time:{task_num}", "end", end_timestamp)
+    finally:
+        await r.aclose()
+    return f"Task {task_num} completed"
+
+
 @pytest.mark.asyncio
 async def test_concurrent_processing():
     """Test that tasks can be processed concurrently up to max_workers"""
-    manager = TaskQueueManager(redis_url="redis://localhost:6379", cleanup_on_start=True)
+    redis_url = "redis://localhost:6379"
+    manager = TaskQueueManager(redis_url=redis_url, cleanup_on_start=True)
     await manager.initialize()
     
     try:
+        # Clean up execution_time keys from previous runs
+        for i in range(4):
+            await manager._redis.delete(f"execution_time:{i}")
+        
         # Create queue with 3 workers
         await manager.create_queue(QueueConfig(
             name="concurrent_queue",
@@ -343,16 +384,6 @@ async def test_concurrent_processing():
         ))
         
         start_time = datetime.now()
-        execution_times = {}
-        
-        async def tracked_task(task_num: int, sleep_time: float):
-            execution_times[task_num] = {
-                'start': datetime.now(),
-                'sleep_time': sleep_time
-            }
-            await asyncio.sleep(sleep_time)
-            execution_times[task_num]['end'] = datetime.now()
-            return f"Task {task_num} completed"
         
         # Submit 4 tasks, each taking 0.5 seconds
         tasks = []
@@ -361,10 +392,11 @@ async def test_concurrent_processing():
                 task_id=f"concurrent_task_{i}",
                 queue_name="concurrent_queue",
                 task_type="test",
-                task_func=tracked_task,
+                task_func=tracked_task_func,
                 priority=QueuePriority.MEDIUM,
                 task_num=i,
-                sleep_time=0.5
+                sleep_time=0.5,
+                redis_url=redis_url
             )
             tasks.append(task_info)
         
@@ -376,10 +408,20 @@ async def test_concurrent_processing():
             status = await manager.get_task_status(task.task_id)
             assert status.status == TaskStatus.COMPLETED
         
+        # Retrieve execution times from Redis
+        start_times = []
+        for i in range(4):
+            start_timestamp = await manager._redis.hget(f"execution_time:{i}", "start")
+            if start_timestamp:
+                start_timestamp = float(start_timestamp)
+                start_times.append(datetime.fromtimestamp(start_timestamp))
+        
+        # Verify we got all execution times
+        assert len(start_times) == 4, f"Expected 4 execution times, got {len(start_times)}"
+        
         # Verify concurrent execution
         # First 3 tasks should start at almost the same time
         # Fourth task should start after one of the first 3 finishes
-        start_times = [execution_times[i]['start'] for i in range(4)]
         start_times.sort()
         
         # First 3 tasks should start within 0.1s of each other
