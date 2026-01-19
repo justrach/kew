@@ -158,7 +158,8 @@ class TaskQueueManager:
             queue_len = await self._redis.zcard(queue_key)
             if queue_len >= worker_pool.config.max_size:
                 raise QueueProcessorError(
-                    f"Queue {queue_name} is full (max_size={worker_pool.config.max_size})"
+                    f"Queue {queue_name} is full "
+                    f"(max_size={worker_pool.config.max_size})"
                 )
 
             # Duplicate protection by task_id
@@ -271,12 +272,14 @@ class TaskQueueManager:
                             ex=self.TASK_EXPIRY_SECONDS,
                         )
 
-                        # Create a wrapper to run the task and reliably release the semaphore
+                        # Create a wrapper to run the task and reliably release
+                        # the semaphore
                         async def _runner(tid: str, f: Callable, a: tuple, kw: dict):
                             try:
                                 await self._execute_task(tid, f, a, kw)
                             finally:
-                                # Cleanup and release a worker slot regardless of outcome
+                                # Cleanup and release a worker slot regardless of
+                                # outcome
                                 worker_pool._tasks.pop(tid, None)
                                 asyncio.create_task(
                                     self._redis.delete(f"task_payload:{tid}")
@@ -403,9 +406,9 @@ class TaskQueueManager:
             "current_workers": worker_pool.config.max_workers
             - worker_pool.processing_semaphore._value,
             "queued_tasks": queue_size,
-            "circuit_breaker_status": "open"
-            if worker_pool.circuit_breaker.is_open
-            else "closed",
+            "circuit_breaker_status": (
+                "open" if worker_pool.circuit_breaker.is_open else "closed"
+            ),
         }
 
     async def shutdown(self, wait: bool = True, timeout: float = 5.0):

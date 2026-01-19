@@ -67,12 +67,12 @@ class TaskInfo(Generic[T]):
             "priority": self.priority,
             "status": self.status.value,
             "queued_time": self.queued_time.isoformat(),
-            "started_time": self.started_time.isoformat()
-            if self.started_time
-            else None,
-            "completed_time": self.completed_time.isoformat()
-            if self.completed_time
-            else None,
+            "started_time": (
+                self.started_time.isoformat() if self.started_time else None
+            ),
+            "completed_time": (
+                self.completed_time.isoformat() if self.completed_time else None
+            ),
             "result": self.result,
             "error": self.error,
         }
