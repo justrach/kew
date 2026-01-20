@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- Multi-process worker support with Redis-based task storage
+  - Store task payloads (func/args/kwargs) in Redis using cloudpickle
+  - Enable distributed workers across multiple processes/machines
+  - Add `max_circuit_breaker_failures` configuration option
+  - Implement automatic payload cleanup after task completion
+
+### Dependencies
+- Added `cloudpickle>=3.0.0` for robust function serialization
+
 All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning when applicable.
