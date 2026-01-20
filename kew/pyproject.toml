@@ -23,6 +23,7 @@ classifiers = [
 keywords = ["async", "queue", "task", "manager", "concurrent", "redis"]
 dependencies = [
     "redis>=5.0.0",
+    "cloudpickle>=1.1.1",
 ]
 
 [project.optional-dependencies]

@@ -1,5 +1,7 @@
-import pytest
 import asyncio
+
+import pytest
+
 
 @pytest.fixture(scope="session")
 def event_loop():
@@ -9,7 +11,8 @@ def event_loop():
     yield loop
     loop.close()
 
+
 @pytest.fixture(scope="session")
 def anyio_backend():
     """Backend for anyio/pytest-asyncio."""
-    return 'asyncio'
+    return "asyncio"
