@@ -249,9 +249,27 @@ await manager.create_queue(QueueConfig(
 
 ## Performance & Reliability
 
-- Reduced worker-loop idle delay (from 100ms to 20ms) for faster task pickup and lower test flakiness.
-- Graceful shutdown: awaits active tasks, flushes callbacks, and uses Redis `aclose()` to avoid deprecation warnings and lost updates.
-- Requires Redis 7 locally and in CI.
+### Redis Pipelining & Batching (v0.1.8)
+
+Kew now uses Redis pipelining to minimize network round-trips:
+
+| Operation | Before | After | Improvement |
+|-----------|--------|-------|-------------|
+| `submit_task` | 0.95ms | 0.28ms | **3.4x faster** |
+| `cleanup` (500 keys) | 890ms | 555ms | **1.6x faster** |
+| `get_ongoing_tasks` | 288ms | 187ms | **1.5x faster** |
+| Throughput | 855/sec | 1550/sec | **1.8x faster** |
+
+Key optimizations:
+- **Pipelined validation**: Queue size check + duplicate check in single round-trip
+- **Pipelined writes**: Payload, task info, and queue entry written atomically
+- **Batch deletes**: Uses `UNLINK` for non-blocking bulk cleanup
+- **MGET batching**: Fetches multiple task statuses in chunks of 500
+
+### Other Performance Features
+- Reduced worker-loop idle delay (from 100ms to 20ms) for faster task pickup
+- Graceful shutdown: awaits active tasks, flushes callbacks, uses Redis `aclose()`
+- Requires Redis 7+ locally and in CI
 
 ## Version History
 
@@ -259,13 +277,15 @@ See the full changelog in [CHANGELOG.md](CHANGELOG.md).
 
 | Version | Highlights |
 |---------|-----------|
-| 0.1.7 (current) | Multi-process worker support, Redis task storage ([@Ahmad-cercli](https://github.com/Ahmad-cercli)) |
+| 0.1.8 (current) | Redis pipelining & batching, 3.4x faster task submission |
+| 0.1.7 | Multi-process worker support, Redis task storage ([@Ahmad-cercli](https://github.com/Ahmad-cercli)) |
 | 0.1.5 | Faster task pickup, reliable shutdown, Redis 7 support |
 | 0.1.4 | Stable async queues, priorities, circuit breakers |
 
 ## Roadmap
 
 ### Completed ✅
+- [x] Redis pipelining & batching for 3.4x faster operations (v0.1.8)
 - [x] Distributed workers with coordination for multi-process scaling (v0.1.7 - [@Ahmad-cercli](https://github.com/Ahmad-cercli))
 - [x] Configurable circuit breaker max failures per queue (v0.1.7)
 
