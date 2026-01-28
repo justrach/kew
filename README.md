@@ -227,37 +227,60 @@ print(f"Active Tasks: {queue_status['current_workers']}")
 print(f"Circuit Breaker: {queue_status['circuit_breaker_status']}")
 ```
 
-## Performance & Reliability (v0.1.5)
+## What's New in v0.1.7
+
+### Multi-Process Worker Support 🎉
+
+Kew now supports distributed workers across multiple processes and machines! Thanks to [@Ahmad-cercli](https://github.com/Ahmad-cercli) for contributing this feature in [PR #5](https://github.com/justrach/kew/pull/5).
+
+- **Redis-based task storage**: Task payloads (func/args/kwargs) are stored in Redis using cloudpickle
+- **Distributed workers**: Run workers across multiple processes or machines
+- **Configurable circuit breaker**: `max_circuit_breaker_failures` option per queue
+- **Automatic cleanup**: Payload cleanup after task completion
+
+```python
+# Now you can run workers in separate processes!
+await manager.create_queue(QueueConfig(
+    name="distributed_tasks",
+    max_workers=4,
+    max_circuit_breaker_failures=5  # New configurable option
+))
+```
+
+## Performance & Reliability
 
 - Reduced worker-loop idle delay (from 100ms to 20ms) for faster task pickup and lower test flakiness.
 - Graceful shutdown: awaits active tasks, flushes callbacks, and uses Redis `aclose()` to avoid deprecation warnings and lost updates.
 - Requires Redis 7 locally and in CI.
 
-## Version Differences
+## Version History
 
 See the full changelog in [CHANGELOG.md](CHANGELOG.md).
 
-- 0.1.5 (current)
-  - Faster task pickup (idle delay 100ms → 20ms)
-  - More reliable shutdown (await tasks, flush callbacks, Redis `aclose()`)
-  - Tests: 7/7 passing; coverage gate restored to 80% (total ~87%)
-  - Docs: examples aligned with async API (`task_type`, `priority`)
-  - CI: Redis 7 service; pip cache; simplified install
-- 0.1.4
-  - Stable async queues, priorities, and concurrency control
-  - Circuit breaker defaults (3 failures, 60s reset)
-  - Known issues: longer idle delay could leave tasks in PROCESSING briefly; Redis `close()` deprecation warnings
+| Version | Highlights |
+|---------|-----------|
+| 0.1.7 (current) | Multi-process worker support, Redis task storage ([@Ahmad-cercli](https://github.com/Ahmad-cercli)) |
+| 0.1.5 | Faster task pickup, reliable shutdown, Redis 7 support |
+| 0.1.4 | Stable async queues, priorities, circuit breakers |
 
 ## Roadmap
 
-- Make circuit breaker settings configurable per queue (max failures, reset timeout)
-- Configurable task expiry and queue polling intervals (idle delay)
-- Retry and backoff policies with dead-letter queue
-- Pause/resume controls and basic admin/health endpoints
-- Metrics and observability (Prometheus/OpenTelemetry), richer `get_queue_status()`
-- Distributed workers with coordination (locks) for multi-process scaling
-- Rate limiting per queue and burst control
-- CLI tooling for inspection and maintenance
+### Completed ✅
+- [x] Distributed workers with coordination for multi-process scaling (v0.1.7 - [@Ahmad-cercli](https://github.com/Ahmad-cercli))
+- [x] Configurable circuit breaker max failures per queue (v0.1.7)
+
+### In Progress 🚧
+- [ ] Configurable circuit breaker reset timeout per queue
+- [ ] Configurable task expiry and queue polling intervals
+
+### Planned 📋
+- [ ] Retry and backoff policies with dead-letter queue
+- [ ] Pause/resume controls and basic admin/health endpoints
+- [ ] Metrics and observability (Prometheus/OpenTelemetry)
+- [ ] Richer `get_queue_status()` with detailed metrics
+- [ ] Rate limiting per queue and burst control
+- [ ] CLI tooling for inspection and maintenance
+- [ ] Web dashboard for task monitoring
 
 ## Configuration
 
@@ -294,6 +317,17 @@ except QueueProcessorError as e:
 ## Contributing
 
 We welcome contributions! Please check our [Contributing Guide](CONTRIBUTING.md) for details.
+
+## Contributors
+
+Thanks to these wonderful people for their contributions:
+
+| Contributor | Contribution |
+|-------------|--------------|
+| [@justrach](https://github.com/justrach) | Creator & Maintainer |
+| [@Ahmad-cercli](https://github.com/Ahmad-cercli) | Multi-process worker support with Redis task storage ([PR #5](https://github.com/justrach/kew/pull/5)) |
+
+Want to see your name here? Check out the [Contributing Guide](CONTRIBUTING.md)!
 
 ## License
 

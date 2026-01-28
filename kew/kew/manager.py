@@ -92,7 +92,10 @@ class TaskQueueManager:
 
     async def initialize(self):
         self._redis = redis.from_url(
-            self._redis_url, encoding="utf-8", decode_responses=True
+            self._redis_url,
+            encoding="utf-8",
+            decode_responses=True,
+            max_connections=50,  # Explicit connection pool size
         )
         logger.info("Connected to Redis")
 
@@ -103,14 +106,21 @@ class TaskQueueManager:
         if not self._redis:
             return
 
-        async for key in self._redis.scan_iter(f"{self.QUEUE_KEY_PREFIX}*"):
-            await self._redis.delete(key)
+        # Collect all keys to delete
+        keys_to_delete = []
+        for prefix in [
+            self.QUEUE_KEY_PREFIX,
+            self.TASK_KEY_PREFIX,
+            self.TASK_PAYLOAD_PREFIX,
+        ]:
+            async for key in self._redis.scan_iter(f"{prefix}*"):
+                keys_to_delete.append(key)
 
-        async for key in self._redis.scan_iter(f"{self.TASK_KEY_PREFIX}*"):
-            await self._redis.delete(key)
-
-        async for key in self._redis.scan_iter(f"{self.TASK_PAYLOAD_PREFIX}*"):
-            await self._redis.delete(key)
+        # Batch delete in chunks of 1000 using unlink (non-blocking delete)
+        if keys_to_delete:
+            for i in range(0, len(keys_to_delete), 1000):
+                chunk = keys_to_delete[i : i + 1000]
+                await self._redis.unlink(*chunk)
 
         logger.info("Cleaned up all existing queues and tasks")
 
@@ -154,8 +164,15 @@ class TaskQueueManager:
             worker_pool = self.queues[queue_name]
             queue_key = f"{self.QUEUE_KEY_PREFIX}{queue_name}:tasks"
 
+            # Pipeline 1: Batch the validation checks (zcard + get)
+            pipe = self._redis.pipeline()
+            pipe.zcard(queue_key)
+            pipe.get(f"{self.TASK_KEY_PREFIX}{task_id}")
+            results = await pipe.execute()
+
+            queue_len, existing = results[0], results[1]
+
             # Enforce max queue size (backpressure)
-            queue_len = await self._redis.zcard(queue_key)
             if queue_len >= worker_pool.config.max_size:
                 raise QueueProcessorError(
                     f"Queue {queue_name} is full "
@@ -163,7 +180,6 @@ class TaskQueueManager:
                 )
 
             # Duplicate protection by task_id
-            existing = await self._redis.get(f"{self.TASK_KEY_PREFIX}{task_id}")
             if existing is not None:
                 raise TaskAlreadyExistsError(f"Task {task_id} already exists")
 
@@ -179,18 +195,6 @@ class TaskQueueManager:
                 {"func": task_func, "args": args, "kwargs": kwargs}
             )
 
-            await self._redis.set(
-                f"task_payload:{task_id}",
-                base64.b64encode(task_payload).decode("utf-8"),
-                ex=self.TASK_EXPIRY_SECONDS,
-            )
-
-            await self._redis.set(
-                f"{self.TASK_KEY_PREFIX}{task_id}",
-                task_info.to_json(),
-                ex=self.TASK_EXPIRY_SECONDS,
-            )
-
             # New scoring system:
             # score = priority * 1_000_000 + timestamp
             # This ensures:
@@ -199,7 +203,20 @@ class TaskQueueManager:
             current_time = int(datetime.now().timestamp() * 1000)  # milliseconds
             score = (priority.value * 1_000_000) + current_time
 
-            await self._redis.zadd(queue_key, {task_id: score})
+            # Pipeline 2: Batch the writes (set payload, set task_info, zadd)
+            pipe = self._redis.pipeline()
+            pipe.set(
+                f"task_payload:{task_id}",
+                base64.b64encode(task_payload).decode("utf-8"),
+                ex=self.TASK_EXPIRY_SECONDS,
+            )
+            pipe.set(
+                f"{self.TASK_KEY_PREFIX}{task_id}",
+                task_info.to_json(),
+                ex=self.TASK_EXPIRY_SECONDS,
+            )
+            pipe.zadd(queue_key, {task_id: score})
+            await pipe.execute()
 
             logger.info(f"Task {task_id} submitted to queue {queue_name}")
             return task_info
@@ -234,9 +251,14 @@ class TaskQueueManager:
                     if isinstance(task_id, bytes):
                         task_id = task_id.decode("utf-8")
 
-                    task_info_data = await self._redis.get(
-                        f"{self.TASK_KEY_PREFIX}{task_id}"
-                    )
+                    # Pipeline: Fetch task_info and payload together
+                    pipe = self._redis.pipeline()
+                    pipe.get(f"{self.TASK_KEY_PREFIX}{task_id}")
+                    pipe.get(f"task_payload:{task_id}")
+                    results = await pipe.execute()
+
+                    task_info_data, payload_data = results[0], results[1]
+
                     if not task_info_data:
                         worker_pool.processing_semaphore.release()
                         continue
@@ -244,8 +266,6 @@ class TaskQueueManager:
                     task_info = TaskInfo.from_json(task_info_data)
 
                     if task_info.status == TaskStatus.QUEUED:
-                        # Load from Redis
-                        payload_data = await self._redis.get(f"task_payload:{task_id}")
                         if not payload_data:
                             logger.error(
                                 f"Task payload not found for {task_id}, dropping task"
@@ -274,9 +294,11 @@ class TaskQueueManager:
 
                         # Create a wrapper to run the task and reliably release
                         # the semaphore
-                        async def _runner(tid: str, f: Callable, a: tuple, kw: dict):
+                        async def _runner(
+                            tid: str, f: Callable, a: tuple, kw: dict, qname: str
+                        ):
                             try:
-                                await self._execute_task(tid, f, a, kw)
+                                await self._execute_task(tid, f, a, kw, qname)
                             finally:
                                 # Cleanup and release a worker slot regardless of
                                 # outcome
@@ -286,7 +308,9 @@ class TaskQueueManager:
                                 )
                                 worker_pool.processing_semaphore.release()
 
-                        task = asyncio.create_task(_runner(task_id, func, args, kwargs))
+                        task = asyncio.create_task(
+                            _runner(task_id, func, args, kwargs, queue_name)
+                        )
                         worker_pool._tasks[task_id] = {"task": task}
                     else:
                         worker_pool.processing_semaphore.release()
@@ -303,26 +327,29 @@ class TaskQueueManager:
                 await asyncio.sleep(1)
 
     async def _execute_task(
-        self, task_id: str, func: Callable, args: tuple, kwargs: dict
+        self, task_id: str, func: Callable, args: tuple, kwargs: dict, queue_name: str
     ):
-        """Execute a single task and update its status"""
-        try:
-            # Determine timeout from queue config
-            task_info_data_pre = await self._redis.get(
-                f"{self.TASK_KEY_PREFIX}{task_id}"
-            )
-            queue_name = None
-            timeout = None
-            if task_info_data_pre:
-                ti = TaskInfo.from_json(task_info_data_pre)
-                queue_name = ti.queue_name
-                if queue_name in self.queues:
-                    timeout = self.queues[queue_name].config.task_timeout
+        """Execute a single task and update its status.
 
+        Args:
+            task_id: The task identifier
+            func: The function to execute
+            args: Positional arguments for the function
+            kwargs: Keyword arguments for the function
+            queue_name: The queue name (passed in to avoid extra Redis GET)
+        """
+        # Get timeout from queue config (no Redis call needed - we have queue_name)
+        timeout = None
+        if queue_name in self.queues:
+            timeout = self.queues[queue_name].config.task_timeout
+
+        try:
             if timeout and timeout > 0:
                 result = await asyncio.wait_for(func(*args, **kwargs), timeout=timeout)
             else:
                 result = await func(*args, **kwargs)
+
+            # Single GET + SET for completion
             task_info_data = await self._redis.get(f"{self.TASK_KEY_PREFIX}{task_id}")
             if task_info_data:
                 task_info = TaskInfo.from_json(task_info_data)
@@ -336,12 +363,14 @@ class TaskQueueManager:
                     ex=self.TASK_EXPIRY_SECONDS,
                 )
                 logger.info(f"Task {task_id} completed successfully")
-                # Reset circuit breaker on success
-                if queue_name and queue_name in self.queues:
-                    await self.queues[queue_name].circuit_breaker.reset()
+
+            # Reset circuit breaker on success (no Redis call - we have queue_name)
+            if queue_name in self.queues:
+                await self.queues[queue_name].circuit_breaker.reset()
 
         except asyncio.TimeoutError:
             logger.error(f"Task {task_id} timed out")
+            # Single GET + SET for timeout failure
             task_info_data = await self._redis.get(f"{self.TASK_KEY_PREFIX}{task_id}")
             if task_info_data:
                 task_info = TaskInfo.from_json(task_info_data)
@@ -353,16 +382,14 @@ class TaskQueueManager:
                     task_info.to_json(),
                     ex=self.TASK_EXPIRY_SECONDS,
                 )
-            # Record failure in circuit breaker
-            task_info_data_pre = await self._redis.get(
-                f"{self.TASK_KEY_PREFIX}{task_id}"
-            )
-            if task_info_data_pre:
-                ti = TaskInfo.from_json(task_info_data_pre)
-                if ti.queue_name in self.queues:
-                    await self.queues[ti.queue_name].circuit_breaker.record_failure()
+
+            # Record failure in circuit breaker (no extra GET - we have queue_name)
+            if queue_name in self.queues:
+                await self.queues[queue_name].circuit_breaker.record_failure()
+
         except Exception as e:
             logger.error(f"Task {task_id} failed: {str(e)}")
+            # Single GET + SET for exception failure
             task_info_data = await self._redis.get(f"{self.TASK_KEY_PREFIX}{task_id}")
             if task_info_data:
                 task_info = TaskInfo.from_json(task_info_data)
@@ -375,14 +402,10 @@ class TaskQueueManager:
                     task_info.to_json(),
                     ex=self.TASK_EXPIRY_SECONDS,
                 )
-            # Record failure in circuit breaker
-            task_info_data_pre = await self._redis.get(
-                f"{self.TASK_KEY_PREFIX}{task_id}"
-            )
-            if task_info_data_pre:
-                ti = TaskInfo.from_json(task_info_data_pre)
-                if ti.queue_name in self.queues:
-                    await self.queues[ti.queue_name].circuit_breaker.record_failure()
+
+            # Record failure in circuit breaker (no extra GET - we have queue_name)
+            if queue_name in self.queues:
+                await self.queues[queue_name].circuit_breaker.record_failure()
 
     async def get_task_status(self, task_id: str) -> TaskInfo:
         task_data = await self._redis.get(f"{self.TASK_KEY_PREFIX}{task_id}")
@@ -443,12 +466,21 @@ class TaskQueueManager:
         """Get all tasks that are currently being processed."""
         ongoing_tasks = []
 
-        # Scan through all task keys
-        async for key in self._redis.scan_iter(f"{self.TASK_KEY_PREFIX}*"):
-            task_data = await self._redis.get(key)
-            if task_data:
-                task_info = TaskInfo.from_json(task_data)
-                if task_info.status == TaskStatus.PROCESSING:
-                    ongoing_tasks.append(task_info)
+        # Collect all task keys first
+        keys = [key async for key in self._redis.scan_iter(f"{self.TASK_KEY_PREFIX}*")]
+
+        if not keys:
+            return ongoing_tasks
+
+        # Batch fetch using MGET in chunks of 500
+        for i in range(0, len(keys), 500):
+            chunk = keys[i : i + 500]
+            results = await self._redis.mget(*chunk)
+
+            for task_data in results:
+                if task_data:
+                    task_info = TaskInfo.from_json(task_data)
+                    if task_info.status == TaskStatus.PROCESSING:
+                        ongoing_tasks.append(task_info)
 
         return ongoing_tasks
