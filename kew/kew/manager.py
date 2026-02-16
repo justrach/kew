@@ -42,6 +42,50 @@ redis.call('ZADD', queue_key, score, task_id)
 return 0
 """
 
+# Lua script for batch task submission.
+# Submits N tasks in a single round-trip for high-throughput scenarios.
+# KEYS[1] = queue_key
+# ARGV[1] = max_size, ARGV[2] = expiry, ARGV[3] = num_tasks
+# Then per task (6 args each starting at ARGV[4]):
+#   task_key, payload_key, task_json, payload, score, task_id
+# Returns: N (success count), -1 (duplicate at index), -2 (queue full)
+_SUBMIT_BATCH_SCRIPT = """
+local queue_key = KEYS[1]
+local max_size = tonumber(ARGV[1])
+local expiry = tonumber(ARGV[2])
+local num_tasks = tonumber(ARGV[3])
+
+-- Capacity check: current size + batch must fit
+if redis.call('ZCARD', queue_key) + num_tasks > max_size then
+    return -2
+end
+
+-- Check all tasks for duplicates first (fail fast)
+for i = 0, num_tasks - 1 do
+    local task_key = ARGV[4 + i * 6]
+    if redis.call('EXISTS', task_key) == 1 then
+        return -1
+    end
+end
+
+-- All checks passed — write all tasks
+for i = 0, num_tasks - 1 do
+    local base = 4 + i * 6
+    local task_key = ARGV[base]
+    local payload_key = ARGV[base + 1]
+    local task_json = ARGV[base + 2]
+    local payload = ARGV[base + 3]
+    local score = tonumber(ARGV[base + 4])
+    local task_id = ARGV[base + 5]
+    redis.call('SET', task_key, task_json, 'EX', expiry)
+    redis.call('SET', payload_key, payload, 'EX', expiry)
+    redis.call('ZADD', queue_key, score, task_id)
+end
+
+return num_tasks
+"""
+
+
 # Priority multiplier: 10 trillion ms (~317 years) separation between levels
 # Ensures priority ALWAYS dominates over timestamp ordering
 _PRIORITY_MULTIPLIER = 10_000_000_000_000
@@ -99,7 +143,6 @@ class QueueWorkerPool:
         self._tasks: Dict[str, Dict[str, Any]] = {}
         self.circuit_breaker: Optional[RedisCircuitBreaker] = None
         self.processing_semaphore = asyncio.Semaphore(config.max_workers)
-        self._submit_lock = asyncio.Lock()
 
 
 class TaskQueueManager:
@@ -125,6 +168,7 @@ class TaskQueueManager:
         self._shutdown_event = asyncio.Event()
         self._cleanup_on_start = cleanup_on_start
         self._submit_script = None
+        self._submit_batch_script = None
         # Lifecycle hooks
         self._on_task_start = on_task_start
         self._on_task_complete = on_task_complete
@@ -158,6 +202,9 @@ class TaskQueueManager:
         # Register the Lua submit script on the binary connection
         # (it handles both text task_info and binary payload in one round-trip)
         self._submit_script = self._redis_binary.register_script(_SUBMIT_SCRIPT)
+        self._submit_batch_script = self._redis_binary.register_script(
+            _SUBMIT_BATCH_SCRIPT
+        )
 
         logger.info("Connected to Redis")
 
@@ -257,8 +304,115 @@ class TaskQueueManager:
 
         worker_pool = self.queues[queue_name]
 
-        async with worker_pool._submit_lock:
-            queue_key = f"{self.QUEUE_KEY_PREFIX}{queue_name}:tasks"
+        queue_key = f"{self.QUEUE_KEY_PREFIX}{queue_name}:tasks"
+
+        task_info = TaskInfo(
+            task_id=task_id,
+            task_type=task_type,
+            queue_name=queue_name,
+            priority=priority.value,
+        )
+
+        # Serialize function and args with cloudpickle (binary, no base64)
+        task_payload = cloudpickle.dumps(
+            {"func": task_func, "args": args, "kwargs": kwargs}
+        )
+
+        # Score calculation: priority * multiplier + execution_time_ms
+        current_time_ms = int(time.time() * 1000)
+
+        if _defer_until is not None:
+            exec_time_ms = int(_defer_until.timestamp() * 1000)
+        elif _defer_by is not None:
+            if isinstance(_defer_by, timedelta):
+                defer_ms = int(_defer_by.total_seconds() * 1000)
+            else:
+                defer_ms = int(_defer_by * 1000)
+            exec_time_ms = current_time_ms + defer_ms
+        else:
+            exec_time_ms = current_time_ms
+
+        score = (priority.value * _PRIORITY_MULTIPLIER) + exec_time_ms
+
+        # Single round-trip: Lua script atomically checks existence,
+        # checks queue size, stores task_info, stores payload, and
+        # adds to queue sorted set.
+        payload_key = f"{self.TASK_PAYLOAD_PREFIX}{task_id}"
+        result = await self._submit_script(
+            keys=[
+                f"{self.TASK_KEY_PREFIX}{task_id}",
+                payload_key,
+                queue_key,
+            ],
+            args=[
+                worker_pool.config.max_size,
+                task_info.to_json(),
+                self.TASK_EXPIRY_SECONDS,
+                task_payload,
+                score,
+                task_id,
+            ],
+        )
+
+        if result == -1:
+            raise TaskAlreadyExistsError(f"Task {task_id} already exists")
+        elif result == -2:
+            raise QueueProcessorError(
+                f"Queue {queue_name} is full "
+                f"(max_size={worker_pool.config.max_size})"
+            )
+
+        logger.info(f"Task {task_id} submitted to queue {queue_name}")
+        return task_info
+
+    async def submit_tasks(
+        self,
+        queue_name: str,
+        tasks: List[Dict[str, Any]],
+    ) -> List[TaskInfo]:
+        """Submit multiple tasks in batched Redis round-trips.
+
+        Each task dict must contain:
+            task_id: str - Unique identifier
+            task_type: str - Type label
+            task_func: Callable - Async callable to execute
+            priority: QueuePriority - Task priority
+
+        Optional keys:
+            args: tuple - Positional arguments for task_func
+            kwargs: dict - Keyword arguments for task_func
+            _defer_until: datetime - Execute at this time
+            _defer_by: float|timedelta - Delay by this amount
+
+        Args:
+            queue_name: Name of the queue to submit to
+            tasks: List of task definitions
+
+        Returns:
+            List of TaskInfo instances for all submitted tasks
+        """
+        if queue_name not in self.queues:
+            raise QueueNotFoundError(f"Queue {queue_name} not found")
+
+        if not tasks:
+            return []
+
+        worker_pool = self.queues[queue_name]
+        queue_key = f"{self.QUEUE_KEY_PREFIX}{queue_name}:tasks"
+        current_time_ms = int(time.time() * 1000)
+
+        # Pre-serialize all tasks
+        prepared = []
+        task_infos = []
+        for t in tasks:
+            task_id = t["task_id"]
+            task_type = t["task_type"]
+            task_func = t["task_func"]
+            priority = t["priority"]
+            args = t.get("args", ())
+            kwargs = t.get("kwargs", {})
+            defer_until = t.get("_defer_until")
+            defer_by = t.get("_defer_by")
 
             task_info = TaskInfo(
                 task_id=task_id,
@@ -266,58 +420,67 @@ class TaskQueueManager:
                 queue_name=queue_name,
                 priority=priority.value,
             )
+            task_infos.append(task_info)
 
-            # Serialize function and args with cloudpickle (binary, no base64)
-            task_payload = cloudpickle.dumps(
+            payload = cloudpickle.dumps(
                 {"func": task_func, "args": args, "kwargs": kwargs}
             )
 
-            # Score calculation: priority * multiplier + execution_time_ms
-            current_time_ms = int(time.time() * 1000)
-
-            if _defer_until is not None:
-                exec_time_ms = int(_defer_until.timestamp() * 1000)
-            elif _defer_by is not None:
-                if isinstance(_defer_by, timedelta):
-                    defer_ms = int(_defer_by.total_seconds() * 1000)
+            if defer_until is not None:
+                exec_time_ms = int(defer_until.timestamp() * 1000)
+            elif defer_by is not None:
+                if isinstance(defer_by, timedelta):
+                    defer_ms = int(defer_by.total_seconds() * 1000)
                 else:
-                    defer_ms = int(_defer_by * 1000)
+                    defer_ms = int(defer_by * 1000)
                 exec_time_ms = current_time_ms + defer_ms
             else:
                 exec_time_ms = current_time_ms
 
             score = (priority.value * _PRIORITY_MULTIPLIER) + exec_time_ms
 
-            # Single round-trip: Lua script atomically checks existence,
-            # checks queue size, stores task_info, stores payload, and
-            # adds to queue sorted set.
-            payload_key = f"{self.TASK_PAYLOAD_PREFIX}{task_id}"
-            result = await self._submit_script(
-                keys=[
+            prepared.append((task_id, task_info, payload, score))
+
+        # Submit in chunks of 50 (Redis Lua arg limit is 7000+,
+        # but 50 * 6 = 300 args is a safe sweet spot)
+        CHUNK_SIZE = 50
+        for i in range(0, len(prepared), CHUNK_SIZE):
+            chunk = prepared[i : i + CHUNK_SIZE]
+
+            lua_args = [
+                worker_pool.config.max_size,
+                self.TASK_EXPIRY_SECONDS,
+                len(chunk),
+            ]
+            for task_id, task_info, payload, score in chunk:
+                lua_args.extend([
                     f"{self.TASK_KEY_PREFIX}{task_id}",
-                    payload_key,
-                    queue_key,
-                ],
-                args=[
-                    worker_pool.config.max_size,
+                    f"{self.TASK_PAYLOAD_PREFIX}{task_id}",
                     task_info.to_json(),
-                    self.TASK_EXPIRY_SECONDS,
-                    task_payload,
+                    payload,
                     score,
                     task_id,
-                ],
+                ])
+
+            result = await self._submit_batch_script(
+                keys=[queue_key],
+                args=lua_args,
             )
 
             if result == -1:
-                raise TaskAlreadyExistsError(f"Task {task_id} already exists")
+                raise TaskAlreadyExistsError(
+                    "Duplicate task_id found in batch"
+                )
             elif result == -2:
                 raise QueueProcessorError(
                     f"Queue {queue_name} is full "
                     f"(max_size={worker_pool.config.max_size})"
                 )
 
-            logger.info(f"Task {task_id} submitted to queue {queue_name}")
-            return task_info
+        logger.info(
+            f"Batch submitted {len(tasks)} tasks to queue {queue_name}"
+        )
+        return task_infos
 
     async def _process_queue(self, queue_name: str):
         """Process tasks in the queue."""

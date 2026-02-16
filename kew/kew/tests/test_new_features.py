@@ -448,3 +448,168 @@ async def test_get_ongoing_tasks():
 
     finally:
         await manager.shutdown()
+
+
+
+@pytest.mark.asyncio
+async def test_submit_tasks_batch():
+    """Batch submit 100 tasks via submit_tasks() and verify all stored."""
+    manager = TaskQueueManager(cleanup_on_start=True)
+    await manager.initialize()
+
+    try:
+        await manager.create_queue(QueueConfig(
+            name="batch_q",
+            max_workers=10,
+            max_size=200,
+        ))
+
+        async def noop(x: int) -> int:
+            return x
+
+        tasks = [
+            {
+                "task_id": f"batch-{i}",
+                "task_type": "noop",
+                "task_func": noop,
+                "priority": QueuePriority.MEDIUM,
+                "kwargs": {"x": i},
+            }
+            for i in range(100)
+        ]
+
+        result = await manager.submit_tasks("batch_q", tasks)
+
+        assert len(result) == 100
+        for i, info in enumerate(result):
+            assert info.task_id == f"batch-{i}"
+            assert info.queue_name == "batch_q"
+
+        # Verify tasks exist in Redis
+        for i in range(100):
+            status = await manager.get_task_status(f"batch-{i}")
+            assert status.task_id == f"batch-{i}"
+
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_submit_tasks_duplicate_in_batch():
+    """Batch with a pre-existing task_id raises TaskAlreadyExistsError."""
+    manager = TaskQueueManager(cleanup_on_start=True)
+    await manager.initialize()
+
+    try:
+        await manager.create_queue(QueueConfig(
+            name="dup_batch_q",
+            max_workers=5,
+            max_size=100,
+        ))
+
+        async def noop(x: int) -> int:
+            return x
+
+        # Submit one task first
+        await manager.submit_task(
+            task_id="existing-1",
+            queue_name="dup_batch_q",
+            task_type="noop",
+            task_func=noop,
+            priority=QueuePriority.MEDIUM,
+            x=0,
+        )
+
+        # Batch that includes the same task_id
+        tasks = [
+            {
+                "task_id": "existing-1",
+                "task_type": "noop",
+                "task_func": noop,
+                "priority": QueuePriority.MEDIUM,
+                "kwargs": {"x": 1},
+            },
+        ]
+
+        with pytest.raises(TaskAlreadyExistsError):
+            await manager.submit_tasks("dup_batch_q", tasks)
+
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_submit_tasks_backpressure():
+    """Batch exceeding max_size raises QueueProcessorError."""
+    manager = TaskQueueManager(cleanup_on_start=True)
+    await manager.initialize()
+
+    try:
+        await manager.create_queue(QueueConfig(
+            name="bp_batch_q",
+            max_workers=2,
+            max_size=5,
+        ))
+
+        async def noop(x: int) -> int:
+            return x
+
+        tasks = [
+            {
+                "task_id": f"bp-{i}",
+                "task_type": "noop",
+                "task_func": noop,
+                "priority": QueuePriority.MEDIUM,
+                "kwargs": {"x": i},
+            }
+            for i in range(10)  # 10 > max_size of 5
+        ]
+
+        with pytest.raises(QueueProcessorError):
+            await manager.submit_tasks("bp_batch_q", tasks)
+
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_submit_no_lock():
+    """Concurrent submit_task calls (no lock) don't produce duplicates."""
+    manager = TaskQueueManager(cleanup_on_start=True)
+    await manager.initialize()
+
+    try:
+        await manager.create_queue(QueueConfig(
+            name="conc_q",
+            max_workers=50,
+            max_size=200,
+        ))
+
+        async def noop(x: int) -> int:
+            return x
+
+        # Submit 50 tasks concurrently
+        coros = [
+            manager.submit_task(
+                task_id=f"conc-{i}",
+                queue_name="conc_q",
+                task_type="noop",
+                task_func=noop,
+                priority=QueuePriority.MEDIUM,
+                x=i,
+            )
+            for i in range(50)
+        ]
+        results = await asyncio.gather(*coros)
+
+        assert len(results) == 50
+        ids = {r.task_id for r in results}
+        assert len(ids) == 50  # No duplicates
+
+        # Verify all exist in Redis
+        for i in range(50):
+            status = await manager.get_task_status(f"conc-{i}")
+            assert status.task_id == f"conc-{i}"
+
+    finally:
+        await manager.shutdown()

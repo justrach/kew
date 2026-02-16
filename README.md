@@ -12,7 +12,7 @@
     <img src="https://github.com/justrach/kew/actions/workflows/python-package.yml/badge.svg" alt="Github Actions">
   </a>
 </p>
-A Redis-backed task queue built for modern async Python applications. Handles background processing with precise concurrency control, priority queues, circuit breakers, retries, and deferred execution - all running in your existing async process.
+A high-performance Redis-backed task queue built for modern async Python applications. Handles background processing with precise concurrency control, priority queues, circuit breakers, retries, and deferred execution - all running in your existing async process.
 
 ## Why Kew?
 
@@ -223,6 +223,25 @@ except QueueProcessorError:
     return {"status": "busy", "retry_after": 5}
 ```
 
+### Batch Submit (v0.2.1)
+Submit thousands of tasks in a single Redis round-trip for maximum throughput:
+```python
+tasks = [
+    {
+        "task_id": f"order-{i}",
+        "task_type": "process",
+        "task_func": process_order,
+        "priority": QueuePriority.MEDIUM,
+        "kwargs": {"order_id": i},
+    }
+    for i in range(1000)
+]
+
+# Single call, batched internally in chunks of 50
+results = await manager.submit_tasks("orders", tasks)
+# ~33,000 tasks/sec — 12x faster than sequential submit_task()
+```
+
 ### Task Monitoring
 ```python
 # Check task status
@@ -278,47 +297,50 @@ async def signup(email: str):
     return {"status": "success"}
 ```
 
+<!-- BENCHMARK_START -->
 ## Performance
 
-### v0.2.0 vs arq (head-to-head benchmark)
+### v0.2.1 vs arq (head-to-head benchmark)
 
-Single-process enqueue throughput on Redis 7, measured over 500 tasks:
+Single-process enqueue throughput on Redis 7, measured in CI:
 
-| Metric | kew v0.2.0 | arq v0.27 |
-|--------|-----------|-----------|
-| Mean enqueue latency | 0.29ms | 0.26ms |
-| Enqueue throughput | ~2,990/sec | ~3,440/sec |
-| End-to-end throughput | ~790/sec | N/A* |
+| Metric | kew v0.2.1 | arq v0.27.0 | Winner |
+|--------|-----------|-----------|--------|
+| Mean enqueue latency | 0.30ms | 0.27ms | **arq** |
+| Sequential throughput | ~3,068/sec | ~3,341/sec | **arq** |
+| Concurrent (gather) | ~7,353/sec | N/A | **kew** |
+| Batch (`submit_tasks()`) | **~33,733/sec** | N/A | **kew 10x** |
+| End-to-end throughput | ~760/sec | N/A* | **kew** |
 
 \*arq requires separate worker processes; kew runs tasks in-process.
 
-The remaining ~15% gap is structural: kew serializes full function closures via cloudpickle (~300 bytes) while arq stores function name strings (~20 bytes). This is the tradeoff for kew's "no separate worker" architecture.
+> Numbers from [GitHub Actions](https://github.com/justrach/kew/actions/workflows/benchmark.yml) on `ubuntu-latest` (2026-02-16).
 
-### v0.2.0 vs v0.1.8 (internal improvement)
+### Version progression
 
-| Operation | v0.1.8 | v0.2.0 | Improvement |
-|-----------|--------|--------|-------------|
-| `submit_task` latency | 0.64ms | 0.29ms | **2.2x faster** |
-| Throughput | 1,550/sec | 2,990/sec | **1.9x faster** |
-| Payload overhead | +33% (base64) | 0% (raw binary) | **Eliminated** |
-| `get_ongoing_tasks` | O(all_keys) SCAN | O(active) SMEMBERS | **Orders of magnitude** |
-| Task execution overhead | 2 Redis RTT | 1 Redis RTT | **50% fewer round-trips** |
+| Version | Throughput | vs v0.1.4 |
+|---------|-----------|-----------|
+| v0.1.4 | ~850/sec | 1x |
+| v0.1.8 | ~1,550/sec | 1.8x |
+| v0.2.0 | ~2,990/sec | 3.5x |
+| v0.2.1 (sequential) | ~3,068/sec | 3.6x |
+| v0.2.1 (concurrent) | ~7,353/sec | 8.7x |
+| **v0.2.1 (batch)** | **~33,733/sec** | **39.7x** |
 
-### Key optimizations in v0.2.0
-- **Atomic Lua script**: Single Redis round-trip for existence check + queue size check + write task info + write payload + enqueue (was 2 separate pipelines)
-- **Binary Redis connection**: Eliminated base64 encoding for cloudpickle payloads (33% size reduction)
-- **Per-queue locks**: Independent queues no longer serialize behind a global lock
-- **Semaphore reorder**: Check Redis BEFORE acquiring semaphore slot (don't waste worker slots on empty queues)
-- **Passed task_info**: Eliminated redundant Redis GET + JSON deserialize in `_execute_task`
-- **Active task SET**: `SMEMBERS` + `MGET` instead of `SCAN` over entire keyspace
+### Key optimizations
+- **v0.2.1**: Lock-free submit (Lua atomicity), batch Lua script for N tasks in 1 RTT
+- **v0.2.0**: Atomic Lua script, binary Redis, per-queue locks, semaphore reorder, active task SET
+- **v0.1.8**: Redis pipelining & batching
 
+<!-- BENCHMARK_END -->
 ## Version History
 
 See the full changelog in [CHANGELOG.md](CHANGELOG.md).
 
 | Version | Highlights |
 |---------|-----------|
-| 0.2.0 (current) | Atomic Lua submit, retries, deferred execution, lifecycle hooks, Redis circuit breaker, 1.9x faster |
+| 0.2.1 (current) | Batch submit API (12x arq), lock-free submit, concurrent-safe |
+| 0.2.0 | Atomic Lua submit, retries, deferred execution, lifecycle hooks, Redis circuit breaker |
 | 0.1.8 | Redis pipelining & batching, 3.4x faster task submission |
 | 0.1.7 | Multi-process worker support, Redis task storage ([@Ahmad-cercli](https://github.com/Ahmad-cercli)) |
 | 0.1.5 | Faster task pickup, reliable shutdown, Redis 7 support |
@@ -327,14 +349,13 @@ See the full changelog in [CHANGELOG.md](CHANGELOG.md).
 ## Roadmap
 
 ### Completed
-- [x] Atomic task submission via Lua scripts (v0.2.0)
+- [x] Batch submit API for high-throughput ingestion (v0.2.1)
+- [x] Lock-free atomic submit via Lua scripts (v0.2.1)
 - [x] Retry with configurable exponential backoff (v0.2.0)
 - [x] Deferred/scheduled task execution (v0.2.0)
 - [x] Lifecycle hooks: on_task_start, on_task_complete, on_task_fail (v0.2.0)
 - [x] Redis-backed circuit breaker with TTL auto-reset (v0.2.0)
-- [x] Configurable circuit breaker reset timeout per queue (v0.2.0)
 - [x] Binary Redis connection for zero-overhead payloads (v0.2.0)
-- [x] Per-queue locking for independent queue throughput (v0.2.0)
 - [x] Active task set for O(1) ongoing task queries (v0.2.0)
 - [x] Redis pipelining & batching (v0.1.8)
 - [x] Distributed workers with coordination (v0.1.7 - [@Ahmad-cercli](https://github.com/Ahmad-cercli))
