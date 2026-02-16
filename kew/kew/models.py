@@ -1,10 +1,10 @@
 import json
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, Dict, Generic, Optional, TypeVar
+from typing import Any, Dict, Generic, Optional, TypeVar, Union
 
-T = TypeVar("T")  # Generic type for task result
+T = TypeVar("T")
 
 
 class TaskStatus(Enum):
@@ -12,15 +12,13 @@ class TaskStatus(Enum):
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
+    RETRY = "retry"
 
 
 class QueuePriority(Enum):
     HIGH = 1
     MEDIUM = 2
     LOW = 3
-
-
-T = TypeVar("T")  # Generic type for task result
 
 
 @dataclass
@@ -33,6 +31,9 @@ class QueueConfig:
     max_size: int = 1000
     task_timeout: int = 3600
     max_circuit_breaker_failures: int = 3
+    circuit_breaker_reset_timeout: int = 60
+    max_retries: int = 0
+    retry_delay: float = 1.0
 
 
 class TaskInfo(Generic[T]):
@@ -42,7 +43,7 @@ class TaskInfo(Generic[T]):
         task_type: str,
         queue_name: str,
         priority: int,
-        status: TaskStatus = TaskStatus.QUEUED,  # Made optional with default
+        status: TaskStatus = TaskStatus.QUEUED,
     ):
         self.task_id = task_id
         self.task_type = task_type
@@ -54,7 +55,7 @@ class TaskInfo(Generic[T]):
         self.completed_time: Optional[datetime] = None
         self.result: Optional[T] = None
         self.error: Optional[str] = None
-        # Store function and arguments for execution
+        self.retry_count: int = 0
         self._func = None
         self._args = ()
         self._kwargs = {}
@@ -75,6 +76,7 @@ class TaskInfo(Generic[T]):
             ),
             "result": self.result,
             "error": self.error,
+            "retry_count": self.retry_count,
         }
 
     def to_json(self) -> str:
@@ -105,4 +107,5 @@ class TaskInfo(Generic[T]):
         )
         task.result = data["result"]
         task.error = data["error"]
+        task.retry_count = data.get("retry_count", 0)
         return task
