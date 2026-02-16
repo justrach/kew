@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.2.1] - 2026-02-16
+
+### Added
+- **Batch submit API**: `submit_tasks()` method submits N tasks in a single Redis round-trip via a new batch Lua script. Chunks of 50 tasks internally.
+- **Concurrent-safe lock-free submit**: Removed `_submit_lock` from `submit_task()` since the Lua script already provides atomicity. Concurrent `asyncio.gather` callers can now overlap Redis round-trips.
+
+### Performance
+- **Batch throughput**: ~33,700 tasks/sec (12x faster than arq sequential)
+- **Concurrent throughput**: ~8,000 tasks/sec via `asyncio.gather` (2.9x arq)
+- **Sequential throughput**: ~3,000 tasks/sec (now faster than arq's ~2,800/sec)
+- kew now **beats arq on every single-process metric**
+
+### Changed
+- `submit_task()` no longer holds a per-queue lock (Lua atomicity is sufficient)
+- New `_SUBMIT_BATCH_SCRIPT` Lua script for multi-task atomic insertion
+
 ## [0.2.0] - 2026-02-16
 
 ### Breaking Changes
@@ -102,6 +118,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - Priority-based scheduling using Redis sorted sets.
 - Per-queue circuit breaker (defaults: 3 failures, 60s reset).
 
+[0.2.1]: https://github.com/justrach/kew/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/justrach/kew/compare/v0.1.8...v0.2.0
 [0.1.8]: https://github.com/justrach/kew/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/justrach/kew/compare/v0.1.5...v0.1.7
