@@ -306,11 +306,11 @@ Single-process enqueue throughput on Redis 7, measured in CI:
 
 | Metric | kew v0.2.1 | arq v0.27.0 | Winner |
 |--------|-----------|-----------|--------|
-| Mean enqueue latency | 0.30ms | 0.27ms | **arq** |
-| Sequential throughput | ~3,068/sec | ~3,341/sec | **arq** |
-| Concurrent (gather) | ~7,353/sec | N/A | **kew** |
-| Batch (`submit_tasks()`) | **~33,733/sec** | N/A | **kew 10x** |
-| End-to-end throughput | ~760/sec | N/A* | **kew** |
+| Mean enqueue latency | 0.67ms | 0.62ms | **arq** |
+| Sequential throughput | ~1,525/sec | ~1,585/sec | **arq** |
+| Concurrent (gather) | ~3,148/sec | N/A | **kew** |
+| Batch (`submit_tasks()`) | **~16,202/sec** | N/A | **kew 10x** |
+| End-to-end throughput | ~351/sec | N/A* | **kew** |
 
 \*arq requires separate worker processes; kew runs tasks in-process.
 
@@ -323,9 +323,9 @@ Single-process enqueue throughput on Redis 7, measured in CI:
 | v0.1.4 | ~850/sec | 1x |
 | v0.1.8 | ~1,550/sec | 1.8x |
 | v0.2.0 | ~2,990/sec | 3.5x |
-| v0.2.1 (sequential) | ~3,068/sec | 3.6x |
-| v0.2.1 (concurrent) | ~7,353/sec | 8.7x |
-| **v0.2.1 (batch)** | **~33,733/sec** | **39.7x** |
+| v0.2.1 (sequential) | ~1,525/sec | 1.8x |
+| v0.2.1 (concurrent) | ~3,148/sec | 3.7x |
+| **v0.2.1 (batch)** | **~16,202/sec** | **19.1x** |
 
 ### Key optimizations
 - **v0.2.1**: Lock-free submit (Lua atomicity), batch Lua script for N tasks in 1 RTT
