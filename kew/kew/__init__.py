@@ -5,12 +5,13 @@ from .exceptions import (
     TaskNotFoundError,
     TaskQueueError,
 )
-from .manager import TaskQueueManager
+from .manager import RedisCircuitBreaker, TaskQueueManager
 from .models import QueueConfig, QueuePriority, TaskInfo, TaskStatus
 
-__version__ = "0.1.5"
+__version__ = "0.2.0"
 __all__ = [
     "TaskQueueManager",
+    "RedisCircuitBreaker",
     "TaskStatus",
     "TaskInfo",
     "QueueConfig",

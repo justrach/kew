@@ -12,7 +12,7 @@
     <img src="https://github.com/justrach/kew/actions/workflows/python-package.yml/badge.svg" alt="Github Actions">
   </a>
 </p>
-A Redis-backed task queue built for modern async Python applications. Handles background processing with precise concurrency control, priority queues, and circuit breakers - all running in your existing async process.
+A Redis-backed task queue built for modern async Python applications. Handles background processing with precise concurrency control, priority queues, circuit breakers, retries, and deferred execution - all running in your existing async process.
 
 ## Why Kew?
 
@@ -22,6 +22,7 @@ Building async applications often means dealing with background tasks. Existing 
 - **True Async**: Native async/await support - no sync/async bridges needed
 - **Precise Control**: Semaphore-based concurrency ensures exact worker limits
 - **Simple Setup**: Just Redis and a few lines of code to get started
+- **Fast**: Single-roundtrip atomic task submission via Lua scripts
 
 ## How It Works
 
@@ -33,7 +34,7 @@ graph LR
     C -->|Execute Task| D[Task Processing]
     D -->|Success| E[Complete]
     D -->|Error| F[Circuit Breaker]
-    F -->|Reset| B
+    F -->|Retry/Reset| B
     style A fill:#f9f,stroke:#333
     style B fill:#bbf,stroke:#333
     style C fill:#bfb,stroke:#333
@@ -46,7 +47,9 @@ stateDiagram-v2
     Submitted --> Queued: Priority Assignment
     Queued --> Processing: Worker Available
     Processing --> Completed: Success
-    Processing --> Failed: Error
+    Processing --> Retry: Error (retries remaining)
+    Retry --> Queued: Backoff Delay
+    Processing --> Failed: Error (no retries)
     Failed --> CircuitOpen: Multiple Failures
     CircuitOpen --> Queued: Circuit Reset
     Completed --> [*]
@@ -72,14 +75,14 @@ async def main():
     # Initialize queue manager
     manager = TaskQueueManager(redis_url="redis://localhost:6379")
     await manager.initialize()
-    
+
     # Create processing queue
     await manager.create_queue(QueueConfig(
         name="orders",
         max_workers=4,  # Only 4 concurrent tasks
         max_size=1000
     ))
-    
+
     # Submit some tasks
     tasks = []
     for i in range(10):
@@ -92,7 +95,7 @@ async def main():
             order_id=str(i)
         )
         tasks.append(task)
-    
+
     # Check results
     # Small delay to allow tasks to complete in this simple example
     await asyncio.sleep(1.2)
@@ -102,83 +105,6 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-```
-
-## Real-World Examples
-
-### Async Web Application
-```python
-from fastapi import FastAPI
-from kew import TaskQueueManager, QueueConfig, QueuePriority
-
-app = FastAPI()
-manager = TaskQueueManager()
-
-@app.on_event("startup")
-async def startup():
-    await manager.initialize()
-    await manager.create_queue(QueueConfig(
-        name="emails",
-        max_workers=2
-    ))
-
-@app.post("/signup")
-async def signup(email: str):
-    # Handle signup immediately
-    user = await create_user(email)
-    
-    # Queue welcome email for background processing
-    await manager.submit_task(
-        task_id=f"welcome-{user.id}",
-        queue_name="emails",
-        task_type="send_welcome_email",
-        task_func=send_welcome_email,
-        priority=QueuePriority.MEDIUM,
-        user_id=user.id
-    )
-    return {"status": "success"}
-```
-
-### Data Processing Script
-```python
-async def process_batch(items: list):
-    manager = TaskQueueManager()
-    await manager.initialize()
-    
-    # Create high and low priority queues
-    await manager.create_queue(QueueConfig(
-        name="critical",
-        max_workers=4,
-        priority=QueuePriority.HIGH
-    ))
-    
-    await manager.create_queue(QueueConfig(
-        name="batch",
-        max_workers=2,
-        priority=QueuePriority.LOW
-    ))
-    
-    # Process priority items first
-    for item in filter(is_priority, items):
-        await manager.submit_task(
-            task_id=f"item-{item.id}",
-            queue_name="critical",
-            task_type="process_item",
-            task_func=process_item,
-            priority=QueuePriority.HIGH,
-            item=item
-        )
-    
-    # Queue remaining items
-    for item in filter(lambda x: not is_priority(x), items):
-        await manager.submit_task(
-            task_id=f"item-{item.id}",
-            queue_name="batch",
-            task_type="process_item",
-            task_func=process_item,
-            priority=QueuePriority.LOW,
-            item=item
-        )
 ```
 
 ## Key Features
@@ -207,11 +133,95 @@ await manager.create_queue(QueueConfig(
 ))
 ```
 
-### Circuit Breakers
-Built-in per-queue circuit breaker tracks consecutive failures and temporarily opens the circuit to protect downstreams.
+### Retry with Exponential Backoff (v0.2.0)
+```python
+await manager.create_queue(QueueConfig(
+    name="flaky_api",
+    max_workers=4,
+    max_retries=3,          # Retry up to 3 times on failure
+    retry_delay=1.0,        # Base delay of 1 second (doubles each retry)
+))
 
-- Defaults: `max_failures=3`, `reset_timeout=60s`
-- Note: Currently not configurable via `QueueConfig`.
+# Tasks that fail will be re-queued automatically:
+# Attempt 1: immediate
+# Attempt 2: +1s delay
+# Attempt 3: +2s delay
+# Attempt 4: +4s delay (or fail permanently)
+```
+
+### Deferred Execution (v0.2.0)
+```python
+from datetime import datetime, timedelta
+
+# Defer by a duration
+await manager.submit_task(
+    task_id="send-reminder",
+    queue_name="emails",
+    task_type="reminder",
+    task_func=send_reminder,
+    priority=QueuePriority.MEDIUM,
+    _defer_by=300.0,  # Execute 5 minutes from now
+    user_id="abc123",
+)
+
+# Defer until a specific time
+await manager.submit_task(
+    task_id="morning-report",
+    queue_name="reports",
+    task_type="report",
+    task_func=generate_report,
+    priority=QueuePriority.LOW,
+    _defer_until=datetime(2025, 1, 15, 9, 0, 0),  # Run at 9 AM
+)
+```
+
+### Lifecycle Hooks (v0.2.0)
+```python
+async def on_start(task_info):
+    print(f"Task {task_info.task_id} started")
+
+async def on_complete(task_info):
+    await metrics.record("task.completed", task_info.task_id)
+
+async def on_fail(task_info, error):
+    await alert_channel.send(f"Task {task_info.task_id} failed: {error}")
+
+manager = TaskQueueManager(
+    redis_url="redis://localhost:6379",
+    on_task_start=on_start,
+    on_task_complete=on_complete,
+    on_task_fail=on_fail,
+)
+```
+
+### Circuit Breakers
+Redis-backed per-queue circuit breaker tracks consecutive failures and temporarily opens the circuit to protect downstreams. Auto-resets via key expiry.
+
+```python
+await manager.create_queue(QueueConfig(
+    name="external_api",
+    max_workers=4,
+    max_circuit_breaker_failures=5,     # Open after 5 consecutive failures
+    circuit_breaker_reset_timeout=30,   # Auto-close after 30 seconds
+))
+```
+
+### Backpressure
+```python
+from kew.exceptions import QueueProcessorError
+
+await manager.create_queue(QueueConfig(
+    name="bounded_queue",
+    max_workers=2,
+    max_size=100,  # Reject submissions beyond 100 queued tasks
+))
+
+try:
+    await manager.submit_task(...)
+except QueueProcessorError:
+    # Queue is full - apply backpressure to caller
+    return {"status": "busy", "retry_after": 5}
+```
 
 ### Task Monitoring
 ```python
@@ -220,6 +230,10 @@ status = await manager.get_task_status("task-123")
 print(f"Status: {status.status}")
 print(f"Result: {status.result}")
 print(f"Error: {status.error}")
+print(f"Retries: {status.retry_count}")
+
+# Get all currently running tasks
+ongoing = await manager.get_ongoing_tasks()
 
 # Monitor queue health
 queue_status = await manager.get_queue_status("api_calls")
@@ -227,49 +241,76 @@ print(f"Active Tasks: {queue_status['current_workers']}")
 print(f"Circuit Breaker: {queue_status['circuit_breaker_status']}")
 ```
 
-## What's New in v0.1.7
+## Real-World Examples
 
-### Multi-Process Worker Support 🎉
-
-Kew now supports distributed workers across multiple processes and machines! Thanks to [@Ahmad-cercli](https://github.com/Ahmad-cercli) for contributing this feature in [PR #5](https://github.com/justrach/kew/pull/5).
-
-- **Redis-based task storage**: Task payloads (func/args/kwargs) are stored in Redis using cloudpickle
-- **Distributed workers**: Run workers across multiple processes or machines
-- **Configurable circuit breaker**: `max_circuit_breaker_failures` option per queue
-- **Automatic cleanup**: Payload cleanup after task completion
-
+### Async Web Application
 ```python
-# Now you can run workers in separate processes!
-await manager.create_queue(QueueConfig(
-    name="distributed_tasks",
-    max_workers=4,
-    max_circuit_breaker_failures=5  # New configurable option
-))
+from fastapi import FastAPI
+from kew import TaskQueueManager, QueueConfig, QueuePriority
+
+app = FastAPI()
+manager = TaskQueueManager()
+
+@app.on_event("startup")
+async def startup():
+    await manager.initialize()
+    await manager.create_queue(QueueConfig(
+        name="emails",
+        max_workers=2,
+        max_retries=3,       # Retry failed email sends
+        retry_delay=5.0,     # 5s base backoff
+    ))
+
+@app.post("/signup")
+async def signup(email: str):
+    # Handle signup immediately
+    user = await create_user(email)
+
+    # Queue welcome email for background processing
+    await manager.submit_task(
+        task_id=f"welcome-{user.id}",
+        queue_name="emails",
+        task_type="send_welcome_email",
+        task_func=send_welcome_email,
+        priority=QueuePriority.MEDIUM,
+        user_id=user.id
+    )
+    return {"status": "success"}
 ```
 
-## Performance & Reliability
+## Performance
 
-### Redis Pipelining & Batching (v0.1.8)
+### v0.2.0 vs arq (head-to-head benchmark)
 
-Kew now uses Redis pipelining to minimize network round-trips:
+Single-process enqueue throughput on Redis 7, measured over 500 tasks:
 
-| Operation | Before | After | Improvement |
-|-----------|--------|-------|-------------|
-| `submit_task` | 0.95ms | 0.28ms | **3.4x faster** |
-| `cleanup` (500 keys) | 890ms | 555ms | **1.6x faster** |
-| `get_ongoing_tasks` | 288ms | 187ms | **1.5x faster** |
-| Throughput | 855/sec | 1550/sec | **1.8x faster** |
+| Metric | kew v0.2.0 | arq v0.27 |
+|--------|-----------|-----------|
+| Mean enqueue latency | 0.29ms | 0.26ms |
+| Enqueue throughput | ~2,990/sec | ~3,440/sec |
+| End-to-end throughput | ~790/sec | N/A* |
 
-Key optimizations:
-- **Pipelined validation**: Queue size check + duplicate check in single round-trip
-- **Pipelined writes**: Payload, task info, and queue entry written atomically
-- **Batch deletes**: Uses `UNLINK` for non-blocking bulk cleanup
-- **MGET batching**: Fetches multiple task statuses in chunks of 500
+\*arq requires separate worker processes; kew runs tasks in-process.
 
-### Other Performance Features
-- Reduced worker-loop idle delay (from 100ms to 20ms) for faster task pickup
-- Graceful shutdown: awaits active tasks, flushes callbacks, uses Redis `aclose()`
-- Requires Redis 7+ locally and in CI
+The remaining ~15% gap is structural: kew serializes full function closures via cloudpickle (~300 bytes) while arq stores function name strings (~20 bytes). This is the tradeoff for kew's "no separate worker" architecture.
+
+### v0.2.0 vs v0.1.8 (internal improvement)
+
+| Operation | v0.1.8 | v0.2.0 | Improvement |
+|-----------|--------|--------|-------------|
+| `submit_task` latency | 0.64ms | 0.29ms | **2.2x faster** |
+| Throughput | 1,550/sec | 2,990/sec | **1.9x faster** |
+| Payload overhead | +33% (base64) | 0% (raw binary) | **Eliminated** |
+| `get_ongoing_tasks` | O(all_keys) SCAN | O(active) SMEMBERS | **Orders of magnitude** |
+| Task execution overhead | 2 Redis RTT | 1 Redis RTT | **50% fewer round-trips** |
+
+### Key optimizations in v0.2.0
+- **Atomic Lua script**: Single Redis round-trip for existence check + queue size check + write task info + write payload + enqueue (was 2 separate pipelines)
+- **Binary Redis connection**: Eliminated base64 encoding for cloudpickle payloads (33% size reduction)
+- **Per-queue locks**: Independent queues no longer serialize behind a global lock
+- **Semaphore reorder**: Check Redis BEFORE acquiring semaphore slot (don't waste worker slots on empty queues)
+- **Passed task_info**: Eliminated redundant Redis GET + JSON deserialize in `_execute_task`
+- **Active task SET**: `SMEMBERS` + `MGET` instead of `SCAN` over entire keyspace
 
 ## Version History
 
@@ -277,27 +318,31 @@ See the full changelog in [CHANGELOG.md](CHANGELOG.md).
 
 | Version | Highlights |
 |---------|-----------|
-| 0.1.8 (current) | Redis pipelining & batching, 3.4x faster task submission |
+| 0.2.0 (current) | Atomic Lua submit, retries, deferred execution, lifecycle hooks, Redis circuit breaker, 1.9x faster |
+| 0.1.8 | Redis pipelining & batching, 3.4x faster task submission |
 | 0.1.7 | Multi-process worker support, Redis task storage ([@Ahmad-cercli](https://github.com/Ahmad-cercli)) |
 | 0.1.5 | Faster task pickup, reliable shutdown, Redis 7 support |
 | 0.1.4 | Stable async queues, priorities, circuit breakers |
 
 ## Roadmap
 
-### Completed ✅
-- [x] Redis pipelining & batching for 3.4x faster operations (v0.1.8)
-- [x] Distributed workers with coordination for multi-process scaling (v0.1.7 - [@Ahmad-cercli](https://github.com/Ahmad-cercli))
-- [x] Configurable circuit breaker max failures per queue (v0.1.7)
+### Completed
+- [x] Atomic task submission via Lua scripts (v0.2.0)
+- [x] Retry with configurable exponential backoff (v0.2.0)
+- [x] Deferred/scheduled task execution (v0.2.0)
+- [x] Lifecycle hooks: on_task_start, on_task_complete, on_task_fail (v0.2.0)
+- [x] Redis-backed circuit breaker with TTL auto-reset (v0.2.0)
+- [x] Configurable circuit breaker reset timeout per queue (v0.2.0)
+- [x] Binary Redis connection for zero-overhead payloads (v0.2.0)
+- [x] Per-queue locking for independent queue throughput (v0.2.0)
+- [x] Active task set for O(1) ongoing task queries (v0.2.0)
+- [x] Redis pipelining & batching (v0.1.8)
+- [x] Distributed workers with coordination (v0.1.7 - [@Ahmad-cercli](https://github.com/Ahmad-cercli))
 
-### In Progress 🚧
-- [ ] Configurable circuit breaker reset timeout per queue
-- [ ] Configurable task expiry and queue polling intervals
-
-### Planned 📋
-- [ ] Retry and backoff policies with dead-letter queue
+### Planned
+- [ ] Dead-letter queue for permanently failed tasks
 - [ ] Pause/resume controls and basic admin/health endpoints
 - [ ] Metrics and observability (Prometheus/OpenTelemetry)
-- [ ] Richer `get_queue_status()` with detailed metrics
 - [ ] Rate limiting per queue and burst control
 - [ ] CLI tooling for inspection and maintenance
 - [ ] Web dashboard for task monitoring
@@ -319,10 +364,10 @@ Tasks expire after 24 hours by default. This value is currently not configurable
 
 Kew provides comprehensive error handling:
 
-- `TaskAlreadyExistsError`: Task ID already in use
+- `TaskAlreadyExistsError`: Task ID already in use (atomic duplicate detection)
 - `TaskNotFoundError`: Task doesn't exist
 - `QueueNotFoundError`: Queue not configured
-- `QueueProcessorError`: Task processing failed
+- `QueueProcessorError`: Task processing failed or queue is full
 
 ```python
 try:
@@ -330,7 +375,7 @@ try:
 except TaskAlreadyExistsError:
     # Handle duplicate task
 except QueueProcessorError as e:
-    # Handle processing error
+    # Handle processing error or queue full
     print(f"Task failed: {e}")
 ```
 
